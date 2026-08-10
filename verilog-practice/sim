@@ -1,0 +1,57 @@
+#! /usr/local/Cellar/icarus-verilog/13.0/bin/vvp
+:ivl_version "13.0 (stable)" "(v13_0)";
+:ivl_delay_selection "TYPICAL";
+:vpi_time_precision - 12;
+:vpi_module "/usr/local/Cellar/icarus-verilog/13.0/lib/ivl/system.vpi";
+:vpi_module "/usr/local/Cellar/icarus-verilog/13.0/lib/ivl/vhdl_sys.vpi";
+:vpi_module "/usr/local/Cellar/icarus-verilog/13.0/lib/ivl/vhdl_textio.vpi";
+:vpi_module "/usr/local/Cellar/icarus-verilog/13.0/lib/ivl/v2005_math.vpi";
+:vpi_module "/usr/local/Cellar/icarus-verilog/13.0/lib/ivl/va_math.vpi";
+S_0x7fd82db07fb0 .scope module, "top_module_tb" "top_module_tb" 2 3;
+ .timescale -9 -12;
+v0x7fd82db184e0_0 .var "a", 0 0;
+v0x7fd82db18580_0 .var "b", 0 0;
+v0x7fd82db18630_0 .net "out", 0 0, L_0x7fd82db18700;  1 drivers
+S_0x7fd82db08120 .scope module, "dut" "top_module" 2 9, 3 1 0, S_0x7fd82db07fb0;
+ .timescale 0 0;
+    .port_info 0 /INPUT 1 "a";
+    .port_info 1 /INPUT 1 "b";
+    .port_info 2 /OUTPUT 1 "out";
+L_0x7fd82db18700 .functor AND 1, v0x7fd82db184e0_0, v0x7fd82db18580_0, C4<1>, C4<1>;
+v0x7fd82db08340_0 .net "a", 0 0, v0x7fd82db184e0_0;  1 drivers
+v0x7fd82db18340_0 .net "b", 0 0, v0x7fd82db18580_0;  1 drivers
+v0x7fd82db183e0_0 .net "out", 0 0, L_0x7fd82db18700;  alias, 1 drivers
+    .scope S_0x7fd82db07fb0;
+T_0 ;
+    %vpi_call 2 16 "$dumpfile", "wave.vcd" {0 0 0};
+    %vpi_call 2 17 "$dumpvars", 32'sb00000000000000000000000000000000, S_0x7fd82db07fb0 {0 0 0};
+    %vpi_call 2 18 "$monitor", "time=%0t a=%b b=%b out=%b", $time, v0x7fd82db184e0_0, v0x7fd82db18580_0, v0x7fd82db18630_0 {0 0 0};
+    %pushi/vec4 0, 0, 1;
+    %store/vec4 v0x7fd82db184e0_0, 0, 1;
+    %pushi/vec4 0, 0, 1;
+    %store/vec4 v0x7fd82db18580_0, 0, 1;
+    %delay 10000, 0;
+    %pushi/vec4 0, 0, 1;
+    %store/vec4 v0x7fd82db184e0_0, 0, 1;
+    %pushi/vec4 1, 0, 1;
+    %store/vec4 v0x7fd82db18580_0, 0, 1;
+    %delay 10000, 0;
+    %pushi/vec4 1, 0, 1;
+    %store/vec4 v0x7fd82db184e0_0, 0, 1;
+    %pushi/vec4 0, 0, 1;
+    %store/vec4 v0x7fd82db18580_0, 0, 1;
+    %delay 10000, 0;
+    %pushi/vec4 1, 0, 1;
+    %store/vec4 v0x7fd82db184e0_0, 0, 1;
+    %pushi/vec4 1, 0, 1;
+    %store/vec4 v0x7fd82db18580_0, 0, 1;
+    %delay 10000, 0;
+    %vpi_call 2 33 "$finish" {0 0 0};
+    %end;
+    .thread T_0;
+# The file index is used to find the file name in the following table.
+:file_names 4;
+    "N/A";
+    "<interactive>";
+    "top_module_tb.v";
+    "top_module.v";
