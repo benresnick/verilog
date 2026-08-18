@@ -17,7 +17,7 @@ module pe #(
 
     output logic signed [DATA_WIDTH-1:0] weight_out,
     output logic                         weight_valid_out,
-
+    
     output logic signed [ACC_WIDTH-1:0] partial_sum
 );
 
