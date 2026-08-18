@@ -1,0 +1,19 @@
+# Ignore simulation binaries and waveforms
+**/*_sim
+**/*_sim/
+*.vcd
+**/*_tb.vcd
+
+# Ignore typical build artifacts
+*.o
+*.out
+*.elf
+*.so
+
+# Editor / OS files
+.DS_Store
+.vscode/
+*~
+
+# Logs
+*.log
