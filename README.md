@@ -8,6 +8,14 @@ vvp sim
 
 ```
 
+To compile and sim (system verilog):
+
+```bash
+iverilog -g2012 -s pe_tb -o pe_sim pe.sv pe_tb.sv
+vvp pe_sim
+
+```
+
 To open up surfer app
 
 ```
