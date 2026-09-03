@@ -60,11 +60,14 @@ jobs, and out-of-capacity dimensions are rejected with `job_error`.
 Requires Icarus Verilog with SystemVerilog support (`iverilog -g2012`).
 
 ```sh
-# Complete regression: PE, buffers, W=1, W=4, array-shape, and corner sweeps
+# Core regression: PE, buffers, W=1..5, array-shape, and corner sweeps
 make regress
 
-# CI-friendly regression; stores logs/regression.log
+# Full CI regression, including two 10-case constrained-random sweeps
 make ci
+
+# Run only the extra randomized parameter configurations
+make random-sweep
 
 # Parameter corner cases: ROWS=1 and non-power-of-two dimensions
 make sweep
@@ -79,8 +82,10 @@ make vcd-w1
 
 The end-to-end testbench includes directed, signed, zero, sparse, partial-tile,
 multiple-K-set, result-backpressure, reset-abort, invalid-job, and seeded
-randomized cases. It prints high-level phases plus tile/set/bank progress while
-running.
+randomized cases. The build sweeps `WEIGHTS_PER_PE=1..5`, width-one and
+non-power-of-two arrays, tall/narrow arrays, and two additional randomized
+array/weight-capacity configurations. It prints high-level phases plus
+tile/set/bank progress while running.
 
 ## Parameters
 

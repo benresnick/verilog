@@ -70,6 +70,10 @@ module weight_stationary_accelerator_tb;
         logic [MW-1:0] held_row;
         logic [NW-1:0] held_col;
         logic signed [AW-1:0] held_data;
+        logic sampled_accept;
+        logic [MW-1:0] sampled_row;
+        logic [NW-1:0] sampled_col;
+        logic signed [AW-1:0] sampled_data;
         integer last_phase, last_load_issue, last_commits;
         integer signed sum;
         begin
@@ -141,6 +145,12 @@ module weight_stationary_accelerator_tb;
                 // until the next accepted result handshake.
                 result_ready = !stall_results || ((limit % 3) != 1);
                 @(posedge clk);
+                // Sample the public result interface before nonblocking DUT
+                // state updates advance the coordinate on this same edge.
+                sampled_accept = result_valid && result_ready;
+                sampled_row = result_row;
+                sampled_col = result_col;
+                sampled_data = result_data;
                 #1; // Observe registered controller state after this edge.
                 cycles++;
                 if (phase != last_phase) begin
@@ -187,20 +197,20 @@ module weight_stationary_accelerator_tb;
                     held_col = result_col;
                     held_data = result_data;
                 end
-                if (result_valid && result_ready) begin
+                if (sampled_accept) begin
                     if (!saw_store) begin
                         $display("[%0t] [PHASE] Storing outputs to DRAM: %s", $time, name);
                         saw_store = 1;
                     end
-                    if (result_received[result_row][result_col]) begin
-                        $error("%s duplicated result C[%0d,%0d]", name, result_row, result_col);
+                    if (result_received[sampled_row][sampled_col]) begin
+                        $error("%s duplicated result C[%0d,%0d]", name, sampled_row, sampled_col);
                         errors++;
                     end
-                    result_received[result_row][result_col] = 1'b1;
+                    result_received[sampled_row][sampled_col] = 1'b1;
                     result_count++;
-                    dram_c[result_row][result_col] = result_data;
+                    dram_c[sampled_row][sampled_col] = sampled_data;
                     $display("[%0t] [RESULT] DRAM C[%0d,%0d] <- %0d",
-                             $time, result_row, result_col, result_data);
+                             $time, sampled_row, sampled_col, sampled_data);
                 end
                 limit++;
             end
