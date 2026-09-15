@@ -1,134 +1,172 @@
-# Parameterized Weight-Stationary Systolic Array
+# Secure-Tagged Weight-Stationary Systolic Array
 
-A synthesizable SystemVerilog matrix-multiplication accelerator that computes
-signed `C = A × B` using a parameterized weight-stationary systolic array.
-
-For an interactive explanation of the mapping, loading order, and dataflow,
-see the [Weight-Stationary Array Lab walkthrough](https://weight-stationary-array-lab.benjamin-resnick1.chatgpt.site/).
-
-## Architecture
-
-The accelerator uses a blocking weight-stationary schedule:
-
-- **PE array:** physical rows represent K indices; physical columns represent
-  a tile of N output columns.
-- **IBuff:** replays the selected A slice with row skew.
-- **WBuff:** loads weights top-to-bottom through each column, issuing target
-  rows bottom-first so every PE captures the intended stationary weight slot.
-- **OBuff:** stores partial sums between local-bank and resident-K-set passes;
-  it feeds each saved partial back into the top edge of the corresponding PE
-  column.
-- **Controller:** advances N tiles, resident K sets, local weight banks, and
-  result-stream coordinates.
-
-`WEIGHTS_PER_PE` controls the number of resident stationary-weight slots in
-each PE.  One resident K set covers:
+This directory contains a parameterized SystemVerilog matrix-multiplication
+accelerator with a compile-time optional, 96-bit protected ownership-tag plane.
+It computes signed matrix multiplication:
 
 ```text
-ARRAY_ROWS × WEIGHTS_PER_PE
+C[m,n] = sum(A[m,k] * B[k,n])
 ```
 
-logical K values.  Larger K values are handled by loading later resident sets;
-larger N values are handled by output-column tiles.
+The numerical design is weight-stationary: selected weights remain in PE-local
+storage, activations move left-to-right, and partial sums move top-to-bottom.
+The tagged build proves that each live partial sum and final result remains
+associated with the trusted tag assigned to its source activation row.
 
-## Main files
+> This is a metadata-propagation and enforcement prototype, not an encryption
+> engine. Numerical data remains plaintext in this RTL. A future trusted egress
+> block can use the final tag to select an encryption context.
+
+## What the protected tag plane does
+
+- Trusted ingress binds one opaque 96-bit tag to every logical `A[m,*]` row.
+- Public stationary weights always have implicit `TAG 0`.
+- One shared tag queue advances in lockstep with the numerical compute pass.
+- Each physical output column observes a read-only tap into that same queue.
+- A protected OBuff tag store mirrors every numerical OBuff commit, including
+  concurrent diagonal commits and retained partial sums across K passes.
+- Feedback is permitted only when the retained partial tag matches the incoming
+  row tag. Missing or incompatible metadata causes a sticky `security_fault`.
+- Faulted work is flushed and final result export is suppressed until reset.
+
+There are no tag registers inside every PE. The arithmetic mesh remains a
+numerical data path; protected ownership travels in parallel and rejoins each
+result at OBuff.
+
+## Four-cycle 2x2 timing example
+
+The diagram shows two users sharing one physical 2x2 array. Blue row A and red
+row B carry distinct opaque tags through exactly one queue. A tap observes its
+queue stage without consuming it, so the same tag can reach a later column on
+the following cycle.
+
+![Shared tag queue timing: two protected users on a 2x2 array](docs/shared-tag-queue-timing.png)
+
+For an array with `ROWS = R` and `COLS = C`:
+
+```text
+queue depth        = R + C - 1
+tap for column pc  = queue stage (R - 1 + pc)
+```
+
+The queue receives one row-tag packet per issued logical row; bubbles are
+preserved. For the numerical schedule used here, row `m` commits at column
+`pc` on compute cycle `m + R + pc`, matching the tap above. Partial final N
+tiles mask inactive columns, so an inactive tap cannot write protected state.
+
+## Trust boundary and interfaces
+
+### Normal build
+
+Without `ENABLE_SECURE_TAGS`, the top level preserves the ordinary numerical
+host interface:
+
+1. While idle, write dimensions with `config_we`.
+2. Write every `A[m,k]` with `a_we` and every `B[k,n]` with `b_we`.
+3. Pulse `start`.
+4. Receive coordinates and values using `result_valid` / `result_ready`.
+
+The disabled elaboration contains no secure tag queue, tag memory, tag checks,
+or trusted tag ports.
+
+### Tagged build
+
+Defining `ENABLE_SECURE_TAGS` adds a trusted integration interface:
+
+| Signal | Direction | Meaning |
+| --- | --- | --- |
+| `trusted_tag_we` | in | Trusted tag-binding event, simultaneous with an A write. |
+| `trusted_tag_row` | in | Logical activation row being bound. |
+| `trusted_tag_data[95:0]` | in | Opaque authenticated ownership/context tag. |
+| `trusted_abort` | in | Trusted cancellation; flushes protected work. |
+| `trusted_result_tag_valid` | out | Trusted final-result metadata is valid. |
+| `trusted_result_tag[95:0]` | out | Opaque tag paired with the public numerical result. |
+| `security_fault` | out | Sanitized sticky status; never reveals a tag value. |
+
+These trusted signals must **not** be mapped into host MMIO, DMA descriptors,
+debug readback, or a software-controlled register file. The tag memories are
+accessible only to internal trusted scheduler, queue, policy, and egress logic.
+
+## Tag policy
+
+The baseline policy is deliberately narrow:
+
+- A first contribution starts with no OBuff tag and resolves to its row tag.
+- A later contribution requires a valid stored OBuff tag equal to that row tag.
+- `TAG 0` weights are public and compatible with any protected row tag.
+- Different nonzero tags, a missing tag for a valid partial, an invalid commit
+  tap, or an export lacking a tag all fail closed.
+
+The RTL does not inspect fields inside a tag. It stores, compares, and propagates
+the entire 96-bit value as opaque metadata.
+
+## Directory layout
 
 | File | Purpose |
 | --- | --- |
-| `pe.sv` | Banked stationary-weight processing element. |
-| `sysarr.sv` | Generated PE mesh and physical edge wiring. |
-| `buffers.sv` | Multi-read IBuff/WBuff and multi-write OBuff primitives. |
-| `weight_stationary_accelerator.sv` | Host interface, buffers, scheduler, and array integration. |
-| `*_tb.sv` | Self-checking PE, buffer, and end-to-end tests. |
-| `Makefile` | Repeatable simulation, sweep, and CI commands. |
+| `weight_stationary_accelerator.sv` | Numerical controller plus tagged integration and fault handling. |
+| `secure_tags.sv` | Tag policy resolver, single shared queue, and protected OBuff tag store. |
+| `pe.sv`, `sysarr.sv` | Banked stationary-weight PE and generated numerical mesh. |
+| `buffers.sv` | IBuff, WBuff, and numerical OBuff primitives. |
+| `secure_tagging_tb.sv` | End-to-end multi-user, tiling, fault, reset, abort, and randomized regression. |
+| `secure_tags_tb.sv` | Unit tests for policy resolution, queue timing, and tag-store concurrency. |
+| `weight_stationary_accelerator_tb.sv` | Original numerical end-to-end regression. |
+| `docs/shared-tag-queue-timing.png` | The shared-queue timing diagram used above. |
 
-## Host interface
+## Build and verification
 
-While idle, `config_ready`, `a_ready`, and `b_ready` are asserted. A host:
-
-1. Writes positive runtime dimensions with `config_we`.
-2. Writes every required `A[m,k]` with `a_we` and `B[k,n]` with `b_we`.
-3. Pulses `start`.
-4. Accepts results through `result_valid` / `result_ready`.
-
-Each result includes `result_row`, `result_col`, and signed `result_data`.
-`done` pulses only after the last result handshake. Missing data, zero-sized
-jobs, and out-of-capacity dimensions are rejected with `job_error`.
-
-## Running tests
-
-Requires Icarus Verilog with SystemVerilog support (`iverilog -g2012`).
+Requires Icarus Verilog with SystemVerilog support.
 
 ```sh
-# Core regression: PE, buffers, W=1..5, array-shape, and corner sweeps
-make regress
+cd tagged_sys_arr_multi_weight_stationary
 
-# Full CI regression, including two 10-case constrained-random sweeps
+# Numerical baseline: macro disabled, no tag hardware elaborated.
 make ci
 
-# Run only the extra randomized parameter configurations
-make random-sweep
-
-# Parameter corner cases: ROWS=1 and non-power-of-two dimensions
-make sweep
-
-# Extra reproducible random cases for WEIGHTS_PER_PE=4
-make random-w4
-
-# Detailed OBuff commit logging or a VCD waveform
-make verbose-w4
-make vcd-w1
-```
-
-## Secure 96-bit row tags
-
-The normal targets build the original public numerical interface.  A separate
-compile-time build enables the protected metadata plane:
-
-```sh
+# Tagged unit regression and default end-to-end secure suite.
+make test-secure-tags
 make tagged
+
+# Tagged shape/weight sweep: 1x1, 1x4, 2x2 W=1/W=4, 3x5, and 4x3.
 make tagged-sweep
+
+# Compile-only checks for both elaborations.
+make lint
+make tagged-lint
+
+# Complete repository-local verification gate.
+make full-ci
 ```
 
-This passes `-DENABLE_SECURE_TAGS`, which adds only trusted-integration ports:
-`trusted_tag_we`, `trusted_tag_row`, and `trusted_tag_data` at ingress, plus
-trusted egress tag observation and a sanitized `security_fault` status.  They
-are deliberately absent from the untagged build and must not be connected to a
-software/MMIO interface.  The trusted tag binds atomically to each A write;
-weights are public (tag zero).  A single `ROWS + COLS - 1` stage queue carries
-row tags, with output-column `pc` tapping stage `ROWS - 1 + pc`.  A protected
-OBuff tag store mirrors concurrent numerical commits and validates every
-partial-sum feedback and final export.  Missing, stale, or incompatible tags
-latch `security_fault`, flush protected state, and suppress output until reset.
+The secure suite covers one, two, three, and per-row-distinct users; K and N
+tiling; partial N tiles; resident-weight banks; full capacities; back-to-back
+jobs; result backpressure; reset; trusted abort; missing tags; conflicting row
+tags; and verification-only fault injection for missing feedback metadata and
+invalid commit taps.
 
-This RTL connectivity models architectural isolation, not protection against
-physical probing, scan access, or side-channel attacks.
-
-`trusted_abort` is a trusted-only cancellation input in the tagged build. It
-flushes queue and secure-OBuff validity and latches the sanitized fault status;
-reset is required before accepting another request. `SECURE_TAG_TEST_HOOKS` is
-used only by the simulation regression to inject missing-feedback-tag and
-invalid-tap conditions. It is never defined by normal or synthesis targets.
-
-The end-to-end testbench includes directed, signed, zero, sparse, partial-tile,
-multiple-K-set, result-backpressure, reset-abort, invalid-job, and seeded
-randomized cases. The build sweeps `WEIGHTS_PER_PE=1..5`, width-one and
-non-power-of-two arrays, tall/narrow arrays, and two additional randomized
-array/weight-capacity configurations. It prints high-level phases plus
-tile/set/bank progress while running.
+`SECURE_TAG_TEST_HOOKS` is defined only by tagged simulation targets. It adds
+internal verification hooks, not production ports, for negative testing.
 
 ## Parameters
 
-Important top-level parameters include:
-
 | Parameter | Meaning |
 | --- | --- |
-| `ROWS` | Number of physical PE rows. |
-| `COLS` | Number of physical PE columns. |
-| `WEIGHTS_PER_PE` | Resident stationary-weight slots per PE. |
-| `DATA_WIDTH` | Signed activation and weight width. |
-| `ACC_WIDTH` | Signed partial-sum/result width. |
-| `MAX_M`, `MAX_K`, `MAX_N` | Bounded matrix-storage capacities. |
+| `ROWS`, `COLS` | Physical PE-array shape. |
+| `WEIGHTS_PER_PE` | Number of resident stationary-weight slots per PE. |
+| `DATA_WIDTH`, `ACC_WIDTH` | Signed operand and accumulated-result widths. |
+| `MAX_M`, `MAX_K`, `MAX_N` | Bounded logical matrix capacities. |
+| `TAG_WIDTH` | Protected tag width; defaults to 96. |
 
-Choose `ACC_WIDTH` large enough for the intended operand range and maximum K.
-For full-precision signed products, it must be at least `2 * DATA_WIDTH`.
+`WEIGHTS_PER_PE` affects local weight capacity and reload frequency. It does
+not change queue depth or tap positions for a single compute pass.
+
+## Limitations and intended next integration
+
+- This implementation does not encrypt, decrypt, authenticate, or derive keys.
+- Architectural connectivity prevents ordinary software from using tags; it
+  does not address physical probing, scan access, fault injection, or
+  side-channel leakage.
+- The trusted ports should be connected through a production trusted-ingress /
+  trusted-egress wrapper before integration into a software-visible system.
+- No synthesis/area comparison is included because no synthesis tool is part
+  of this repository-local flow.
