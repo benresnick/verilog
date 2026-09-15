@@ -1,0 +1,4 @@
+sim_*
+*.vcd
+logs/
+*.md
