@@ -3,10 +3,11 @@
 The tenant key file, forward AES pipeline, GHASH, GCTR, and AES-GCM transaction
 engine are implemented. `tenant_gcm_cluster` connects three private engines to
 the protected key file, encryption IV reservation, and authenticated tenant
-record metadata. The accelerator still transfers plaintext: buffer/tag adapters,
-committed DRAM records, and a full-secure accelerator configuration still require
-integration. Crypto-subsystem tests do not complete the security specification's
-end-to-end acceptance criteria.
+record metadata. The secure-memory build (`secure_memory_accelerator`, see
+[secure-memory.md](secure-memory.md)) connects the cluster to the accelerator:
+authenticated A/B records commit atomically into IBuff/WBuff and row tags, and
+encrypted C records retire only after storage acknowledgement. It is verified
+end to end in simulation against OpenSSL; replay freshness and synthesis remain.
 
 | Specification checkpoint | Status |
 | --- | --- |
@@ -15,7 +16,8 @@ end-to-end acceptance criteria.
 | 4: GCTR and GHASH | Wide counter-mode transform and ordered hashing; GCM controller supplies padding and bit-length framing. |
 | GCM transaction datapath | Encryption, tag verification, bounded plaintext quarantine, and streamed authenticated release. |
 | Trusted tenant crypto wrapper | Shared key file, two decryptors and one encryptor, atomic key/IV capture, busy-slot protection, and automatic AAD. |
-| Secure memory integration and evaluation | Accelerator buffer/tag adapters, atomic destination/record commit, and physical evaluation remain. |
+| Secure memory integration | Implemented in `secure_memory_accelerator` with `authenticated_row_stager`; verified end to end against OpenSSL (`make test-secure-memory`). |
+| Evaluation | Synthesis, timing, area, sustained bandwidth, and replay freshness remain. |
 
 ## Tenant key register file
 
@@ -233,7 +235,7 @@ public output data stays zero until the complete tag matches. Failed decryption
 erases the quarantine and emits no plaintext. Successful decryption releases
 the stored beats in order, respecting stalls and erasing each consumed entry.
 The success result follows the final authenticated output transfer. This is
-authentication-before-release; the future buffer adapter must still provide
+authentication-before-release; `authenticated_row_stager` then provides the
 atomic destination-data and tenant-tag commit, including abort during release.
 
 ```mermaid
@@ -333,9 +335,9 @@ flowchart LR
     K -->|"Private key capture"| A
     K -->|"Private key capture"| W
     K -->|"Atomic key + fresh IV capture"| O
-    A -->|"Authenticated data + tenant + destination"| IA["Future IBuff/tag commit adapter"]
-    W -->|"Authenticated data + destination"| WA["Future WBuff commit adapter"]
-    O -->|"Ciphertext then tag + IV result"| OA["Future DRAM record commit adapter"]
+    A -->|"Authenticated data + tenant + destination"| IA["Row stager: IBuff + row tag commit"]
+    W -->|"Authenticated data + destination"| WA["Row stager: WBuff commit"]
+    O -->|"Ciphertext then tag + IV result"| OA["TGR1 record writer + storage ACK"]
 ```
 
 Key ownership is registered per port and ORed per slot. Two or three ports may
@@ -400,23 +402,34 @@ cancels only path `p`, including a held result, while preserving other paths and
 the key file's advanced IV counters.
 
 The cluster does **not** write IBuff/WBuff/OBuff or expose compute-valid bits.
-The next adapter must stage these authenticated bytes and atomically commit the
-whole destination range with its tenant tags only on successful completion.
-An abort halfway through a successful authenticated output stream must still
-discard that adapter's partial transaction. Similarly, OBuff retirement must
-wait for external record commit, not merely ciphertext ready/valid handshakes.
+In the secure-memory build, `authenticated_row_stager` stages these
+authenticated bytes and the accelerator commits the whole destination row with
+its tenant tag only on successful completion. A clear or abort halfway through
+a successful authenticated output stream discards the staged row. OBuff
+retirement waits for a matching successful storage acknowledgement, not merely
+ciphertext or header handshakes.
 
-## Next integration work
+## Integration status and next work
 
-1. Define encrypted DRAM record framing and connect trusted accelerator command
-   contexts to the cluster's fixed authenticated record metadata.
-2. Add authenticated atomic commit for IBuff plus tenant tags and WBuff using
-   the two decrypt paths; handle abort during destination staging.
-3. Connect OBuff data/ownership to the encrypt path and committed ciphertext
-   records; retire data and metadata together after storage acknowledgment.
-4. Verify interrupted records/commits and concurrent tenants through the whole
-   accelerator, including reset/fault isolation and sustained bandwidth;
-   synthesize baseline, tag-only, and full-secure configurations for evaluation.
+Done in `secure_memory_accelerator` (see [secure-memory.md](secure-memory.md)):
+
+1. `TGR1` DRAM record framing, with trusted command contexts bound into the
+   fixed `TGC1` authenticated metadata.
+2. Authenticated atomic commit of IBuff rows with their tenant tags, and of
+   public WBuff rows, through the two decrypt paths, including cancellation
+   during staging.
+3. OBuff data and ownership routed to the encrypt path; data and tags retire
+   together only after a matching successful storage acknowledgement.
+4. Interrupted records and commits, two tenants per job, storage failure and
+   retry, reset with re-provisioning, and abort, verified end to end.
+
+Remaining:
+
+1. Replay freshness: an old valid record with the same context is accepted.
+2. Synthesize the baseline, tag-only, and full-secure configurations for area
+   and timing (GHASH's combinational chain is the expected critical path).
+3. Measure sustained bandwidth, and specify the physical storage controller's
+   durability and reset-epoch duties.
 
 ## Sources
 

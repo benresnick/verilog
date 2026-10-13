@@ -13,13 +13,14 @@ storage, activations move left-to-right, and partial sums move top-to-bottom.
 The tagged build proves that each live partial sum and final result remains
 associated with the trusted tag assigned to its source activation row.
 
-> The accelerator's memory and result interfaces still carry plaintext.
-> AES-GCM includes quarantined authenticated decryption. A trusted wrapper now
-> connects three crypto paths to protected tenant keys, automatic encryption
-> IV reservation, and authenticated record metadata. Accelerator buffer/tag
-> adapters and DRAM record commit are not yet connected. See
-> [crypto implementation status](docs/crypto-primitives.md) for their contracts
-> and the remaining integration work.
+> The plain and tagged builds still carry plaintext on their memory and result
+> interfaces. The secure-memory build (`secure_memory_accelerator.sv`, with
+> `ENABLE_SECURE_TAGS` and `ENABLE_SECURE_MEMORY`) accepts A and B only as
+> authenticated AES-GCM row records and emits C only as encrypted records that
+> retire after a matching storage acknowledgement. `make test-secure-memory`
+> verifies that path end to end against OpenSSL. See
+> [secure memory](docs/secure-memory.md) and
+> [crypto implementation status](docs/crypto-primitives.md).
 
 ## What the protected tag plane does
 
@@ -91,6 +92,18 @@ These trusted signals must **not** be mapped into host MMIO, DMA descriptors,
 debug readback, or a software-controlled register file. The tag memories are
 accessible only to internal trusted scheduler, queue, policy, and egress logic.
 
+Each accepted `config_we` starts a new ownership epoch: it erases every row tag
+**and every A element's written status**, so the host must rewrite all of A
+(with its tags) before the next `start`. Without this, a new owner could bind a
+row with a single write and inherit the previous owner's remaining elements.
+Public B elements stay valid across epochs. A configure and an A write on the
+same clock edge belong to the new epoch. While `security_fault` is set, the
+ready outputs are low and configure, A and B writes are ignored.
+
+In every build, host writes whose coordinates exceed `MAX_M`, `MAX_K` or `MAX_N`
+are ignored. The coordinate ports can encode those values, and without the range
+check a synthesized buffer would truncate the address and overwrite a real row.
+
 ## Tag policy
 
 The baseline policy is deliberately narrow:
@@ -124,12 +137,19 @@ the entire 96-bit value as opaque metadata.
 | `tenant_gcm_port.sv`, `tenant_gcm_cluster.sv` | Three trusted tenant-aware crypto paths, shared key management, fresh encryption IVs, and automatic authenticated metadata. |
 | `tenant_gcm_cluster_tb.sv`, `tests/run_tenant_gcm.py`, `tests/run_tenant_gcm_negative.py` | Independent record oracle, concurrent tenants, key lifecycle/nonce races, tampering, and negative controls. |
 | `weight_stationary_accelerator_tb.sv` | Original numerical end-to-end regression. |
+| `authenticated_row_stager.sv`, `authenticated_row_stager_tb.sv` | Collects an authenticated row and commits it to IBuff/WBuff atomically. |
+| `secure_memory_accelerator.sv` | Secure-memory top level: encrypted A/B loads, tagged compute, encrypted C stores with acknowledgement-gated retirement. |
+| `secure_memory_accelerator_tb.sv`, `tests/run_secure_memory.py`, `tests/run_secure_memory_negative.py` | End-to-end OpenSSL record oracle, tampering, cancellation, storage retry, reset/abort lifecycle, and mutation controls. |
+| `verilator_waivers.vlt` | Documented, narrowly scoped waivers for `make verilator-lint`. |
 | `docs/shared-tag-queue-timing.png` | The shared-queue timing diagram used above. |
 
 ## Build and verification
 
-Requires Icarus Verilog with SystemVerilog support. GCM tests also require
-Python 3 and a shared OpenSSL `libcrypto`; no third-party Python packages.
+Requires Icarus Verilog 13 or newer (the suite is verified with 13.0; the
+Ubuntu-packaged 12.0 drops values on unpacked-array output ports and hangs
+`run-w1`). GCM and secure-memory tests also require Python 3 and a shared
+OpenSSL `libcrypto`; no third-party Python packages. `make verilator-lint`
+additionally needs Verilator 5.
 
 ```sh
 cd tagged_sys_arr_multi_weight_stationary
@@ -155,9 +175,15 @@ make test-gcm-wide
 make test-tenant-gcm
 make test-tenant-gcm-mutations
 
-# Compile-only checks for both elaborations.
+# Encrypted-record accelerator, end to end against OpenSSL.
+make test-secure-memory
+make test-secure-memory-mutations
+
+# Compile-only checks for all elaborations, plus Verilator lint.
 make lint
 make tagged-lint
+make secure-memory-lint
+make verilator-lint
 
 # Complete repository-local verification gate.
 make full-ci
@@ -194,10 +220,11 @@ not change queue depth or tap positions for a single compute pass.
 
 ## Limitations and intended next integration
 
-- The accelerator does not yet encrypt or authenticate its memory transfers.
-  The crypto cluster now includes protected key/nonce handling, authenticated
-  metadata, three private engines, and decryption quarantine. DRAM record
-  framing and atomic authenticated buffer/tenant-tag commit still need wiring.
+- Only the secure-memory build encrypts and authenticates memory transfers;
+  the plain and tagged builds remain plaintext at their interfaces.
+- The tenant key file is volatile. The trusted provisioner must never restart
+  a retired key/IV sequence after reset or power loss (see
+  [crypto implementation status](docs/crypto-primitives.md)).
 - Architectural connectivity prevents ordinary software from using tags; it
   does not address physical probing, scan access, fault injection, or
   side-channel leakage.
