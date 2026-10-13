@@ -10,8 +10,8 @@ module weight_stationary_accelerator_tb;
     parameter int MAX_K = 10;
     parameter int MAX_N = 6;
 
-    localparam int DW = 8;
-    localparam int AW = 32;
+    parameter int DW = 8;
+    parameter int AW = 32;
     localparam int MW = $clog2(MAX_M + 1);
     localparam int KW = $clog2(MAX_K + 1);
     localparam int NW = $clog2(MAX_N + 1);
@@ -38,7 +38,7 @@ module weight_stationary_accelerator_tb;
     always #5 clk = ~clk;
 
     weight_stationary_accelerator #(
-        .ROWS(ROWS), .COLS(COLS), .WEIGHTS_PER_PE(W),
+        .ROWS(ROWS), .COLS(COLS), .WEIGHTS_PER_PE(W), .DATA_WIDTH(DW), .ACC_WIDTH(AW),
         .MAX_M(MAX_M), .MAX_K(MAX_K), .MAX_N(MAX_N)
     ) dut (
         .*, .debug_weight_set_loads(loads), .debug_mac_count(macs)
@@ -56,7 +56,7 @@ module weight_stationary_accelerator_tb;
             reset = 1; config_we = 0; a_we = 0; b_we = 0;
             start = 0; result_ready = 1;
             repeat (2) @(posedge clk);
-            reset = 0;
+            @(negedge clk); reset = 0;
         end
     endtask
 
@@ -144,6 +144,15 @@ module weight_stationary_accelerator_tb;
                 // requested.  The result coordinate/data must remain stable
                 // until the next accepted result handshake.
                 result_ready = !stall_results || ((limit % 3) != 1);
+                if ($test$plusargs("host_stress")) begin
+                    // Busy commands must not corrupt resident data or shape.
+                    config_we=busy; a_we=busy; b_we=busy; start=busy;
+                    config_m=1;config_k=1;config_n=1;
+                    a_row=0;a_col=0;a_data='1;b_row=0;b_col=0;b_data='1;
+                    // Long stalls include the first and final result, then
+                    // release all columns through a different ready cadence.
+                    result_ready=(limit%43 >= 19);
+                end
                 @(posedge clk);
                 // Sample the public result interface before nonblocking DUT
                 // state updates advance the coordinate on this same edge.
@@ -214,6 +223,7 @@ module weight_stationary_accelerator_tb;
                 end
                 limit++;
             end
+            config_we=0; a_we=0; b_we=0; start=0;
             if (!done) begin
                 $error("timeout %s state=%0d nbase=%0d kset=%0d bank=%0d commits=%0d",
                        name, phase, dut.n_base, dut.kset_base, dut.bank, dut.commits);
@@ -305,6 +315,19 @@ module weight_stationary_accelerator_tb;
     // diagnosis; functional checking continues to use the public result port.
     logic done_seen;
     integer extra_random_cases;
+    logic held_last = 0;
+    logic [MW+NW+AW-1:0] held_result;
+    always @(posedge clk) begin
+        if(reset) held_last <= 0;
+        else begin
+            if(held_last) assert(result_valid && {result_row,result_col,result_data} === held_result)
+                else $fatal(1,"result changed before stalled transfer was consumed");
+            held_last <= result_valid && !result_ready;
+            held_result <= {result_row,result_col,result_data};
+            if(busy) assert(!config_ready && !a_ready && !b_ready)
+                else $fatal(1,"host write interface accepted busy traffic");
+        end
+    end
     always @(posedge clk) if (!reset) begin
         // The blocking baseline never loads weights while computing.
         assert (!(dut.u_array.weight_load && dut.state == 2))
@@ -329,7 +352,11 @@ module weight_stationary_accelerator_tb;
         cycles = 0; errors = 0; passed = 0; failed = 0; done_seen = 0;
         pulse_reset();
         check_invalid_job(0, 1, 1);
+        check_invalid_job(1, 0, 1);
+        check_invalid_job(1, 1, 0);
         check_invalid_job(MAX_M + 1, 1, 1);
+        check_invalid_job(1, MAX_K + 1, 1);
+        check_invalid_job(1, 1, MAX_N + 1);
         check_missing_data_job();
         check_reset_during_compute();
         run_case(1, 1, 1, 1, 0, 0, "scalar signed");
@@ -346,6 +373,7 @@ module weight_stationary_accelerator_tb;
         run_case(3, 4, 3, 2001, 0, 1, "all valid numeric zeros");
         run_case(4, 5, 4, 2002, 0, 2, "sparse matrix");
         run_case(2, 1, 3, 2003, 0, 3, "signed extrema");
+        run_case(MAX_M, MAX_K, MAX_N, 2004, 1, 3, "full-capacity signed accumulation and wrap");
         extra_random_cases = 0;
         void'($value$plusargs("random_iters=%d", extra_random_cases));
         for (int random_index = 0; random_index < extra_random_cases; random_index++)

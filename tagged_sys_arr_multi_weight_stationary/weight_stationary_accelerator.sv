@@ -52,6 +52,23 @@ module weight_stationary_accelerator #(
     output logic signed [ACC_WIDTH-1:0] result_data,
     output logic [3:0] phase,
     output logic [31:0] debug_weight_set_loads, debug_mac_count
+`ifdef ENABLE_SECURE_MEMORY
+    // Authenticated full-row publication. Word zero is the packed MSB word;
+    // current K/N dimensions select the active prefix and tails are erased.
+    , input logic trusted_a_commit_valid,
+    output wire trusted_a_commit_ready,
+    input logic [M_WIDTH-1:0] trusted_a_commit_row,
+    input logic [MAX_K*DATA_WIDTH-1:0] trusted_a_commit_data,
+    input logic [95:0] trusted_a_commit_tenant,
+    input logic trusted_b_commit_valid,
+    output wire trusted_b_commit_ready,
+    input logic [K_WIDTH-1:0] trusted_b_commit_row,
+    input logic [MAX_N*DATA_WIDTH-1:0] trusted_b_commit_data,
+    // Reading a column never retires plaintext. The trusted adapter commits
+    // the current row only after its encrypted DRAM record is durable.
+    input logic [N_WIDTH-1:0] trusted_result_read_col,
+    input logic trusted_result_row_commit
+`endif
 `ifdef ENABLE_SECURE_TAGS
     // Trusted integration only: these ports are intentionally absent from the
     // ordinary build and are not a software-visible tag register interface.
@@ -135,9 +152,50 @@ module weight_stationary_accelerator #(
 `endif
 `endif
 
+`ifdef ENABLE_SECURE_MEMORY
+    wire memory_cancel;
+    wire memory_fault_clear;
+`ifdef ENABLE_SECURE_TAGS
+    assign memory_cancel = reset || trusted_abort || security_fault;
+    assign memory_fault_clear = memory_cancel || secure_fault_request;
+`else
+    // Keep unsupported elaborations fail-closed until the diagnostic below.
+    assign memory_cancel = 1'b1;
+    assign memory_fault_clear = 1'b1;
+`endif
+    wire memory_config_accept = config_we && config_ready;
+    wire memory_zeroize = memory_fault_clear || memory_config_accept;
+    wire memory_legal_config = m_cfg != 0 && k_cfg != 0 && n_cfg != 0 &&
+        m_cfg <= MAX_M && k_cfg <= MAX_K && n_cfg <= MAX_N;
+    wire memory_commit_window = state == IDLE && memory_legal_config &&
+        !memory_cancel && !config_we && !start;
+    assign trusted_a_commit_ready = memory_commit_window &&
+        trusted_a_commit_row < m_cfg && trusted_a_commit_row < MAX_M;
+    assign trusted_b_commit_ready = memory_commit_window &&
+        trusted_b_commit_row < k_cfg && trusted_b_commit_row < MAX_K;
+    wire memory_a_commit = trusted_a_commit_valid && trusted_a_commit_ready;
+    wire memory_b_commit = trusted_b_commit_valid && trusted_b_commit_ready;
+    wire memory_peek_in_range = trusted_result_read_col < n_dim &&
+        trusted_result_read_col < MAX_N && out_m < m_dim && out_m < MAX_M;
+    wire memory_retire_row = trusted_result_row_commit && result_valid && !memory_cancel;
+    initial begin
+`ifndef ENABLE_SECURE_TAGS
+        $fatal(1, "ENABLE_SECURE_MEMORY requires ENABLE_SECURE_TAGS");
+`endif
+        if (TAG_WIDTH != 96) $fatal(1, "Secure memory requires 96-bit tenant tags");
+        if (DATA_WIDTH < 8 || DATA_WIDTH % 8 != 0 || ACC_WIDTH < 8 || ACC_WIDTH % 8 != 0)
+            $fatal(1, "Secure memory requires byte-aligned data and accumulator widths");
+    end
+`endif
+
     // Host writes are only accepted while idle.  Result transfers are the
     // exception: they occur in RESULTS with their own ready/valid handshake.
     assign busy = (state != IDLE);
+`ifdef ENABLE_SECURE_MEMORY
+    assign config_ready = (state == IDLE) && !memory_cancel;
+    assign a_ready = 1'b0;
+    assign b_ready = 1'b0;
+`else
 `ifdef ENABLE_SECURE_TAGS
     assign config_ready = (state == IDLE) && !security_fault;
     assign a_ready = (state == IDLE) && !security_fault;
@@ -146,6 +204,7 @@ module weight_stationary_accelerator #(
     assign config_ready = (state == IDLE);
     assign a_ready = (state == IDLE);
     assign b_ready = (state == IDLE);
+`endif
 `endif
     assign phase = state;
     always_comb begin
@@ -167,18 +226,36 @@ module weight_stationary_accelerator #(
   // The final extra OBuff read port is reserved for result streaming; ports
   // 0..COLS-1 below are reserved for compute feedback.
   obuf_read_row[COLS] = out_m;
+`ifdef ENABLE_SECURE_MEMORY
+  // Clamp the physical array address as well as masking the public peek.
+  obuf_read_col[COLS] = memory_peek_in_range ? trusted_result_read_col : '0;
+`else
   obuf_read_col[COLS] = out_n;
+`endif
 `ifdef ENABLE_SECURE_TAGS
-  raw_result_valid = (state == RESULTS) && obuf_read_final[COLS];
+  raw_result_valid = (state == RESULTS) && obuf_read_final[COLS]
+`ifdef ENABLE_SECURE_MEMORY
+                     && memory_peek_in_range && !memory_cancel
+`endif
+                     ;
   result_valid = raw_result_valid && secure_obuff_read_valid[COLS] && !security_fault;
   trusted_result_tag_valid = result_valid;
+`ifdef ENABLE_SECURE_MEMORY
+  trusted_result_tag = result_valid ? secure_obuff_read_tag[COLS] : '0;
+`else
   trusted_result_tag = secure_obuff_read_tag[COLS];
+`endif
 `else
   result_valid = (state == RESULTS) && obuf_read_final[COLS];
 `endif
   result_row = out_m;
+`ifdef ENABLE_SECURE_MEMORY
+  result_col = result_valid ? trusted_result_read_col : '0;
+  result_data = result_valid ? obuf_read_data[COLS] : '0;
+`else
   result_col = out_n;
   result_data = obuf_read_data[COLS];
+`endif
   // Activation row pr is issued at local cycle m+pr.  This horizontal skew
   // makes it meet the matching vertical psum at PE[pr,pc].
   for (int pr = 0; pr < ROWS; pr++) begin
@@ -278,6 +355,11 @@ module weight_stationary_accelerator #(
                                   ),
         .write_row(a_row), .write_col(a_col), .write_data(a_data),
         .read_row(ibuf_read_row), .read_col(ibuf_read_col), .read_data(ibuf_read_data)
+`ifdef ENABLE_SECURE_MEMORY
+        , .secure_clear(memory_zeroize), .secure_row_commit(memory_a_commit),
+        .secure_row(trusted_a_commit_row), .secure_row_words(32'(k_cfg)),
+        .secure_row_data(trusted_a_commit_data)
+`endif
     );
 
     // WBuff provides one bottom-row-first load token per physical column.
@@ -288,6 +370,11 @@ module weight_stationary_accelerator #(
         .clk(clk), .write_enable(b_we && b_ready),
         .write_row(b_row), .write_col(b_col), .write_data(b_data),
         .read_row(wbuf_read_row), .read_col(wbuf_read_col), .read_data(wbuf_read_data)
+`ifdef ENABLE_SECURE_MEMORY
+        , .secure_clear(memory_zeroize), .secure_row_commit(memory_b_commit),
+        .secure_row(trusted_b_commit_row), .secure_row_words(32'(n_cfg)),
+        .secure_row_data(trusted_b_commit_data)
+`endif
     );
 
     multi_write_output_buffer #(
@@ -301,16 +388,26 @@ module weight_stationary_accelerator #(
 `ifdef ENABLE_SECURE_TAGS
                       || secure_fault_request
 `endif
+`ifdef ENABLE_SECURE_MEMORY
+                      || memory_zeroize
+`endif
                       ),
         .write_enable(obuf_write_enable), .write_row(obuf_write_row),
         .write_col(obuf_write_col), .write_data(obuf_write_data),
         .write_final(obuf_write_final), .read_row(obuf_read_row), .read_col(obuf_read_col),
         .read_data(obuf_read_data), .read_valid(obuf_read_valid), .read_final(obuf_read_final)
+`ifdef ENABLE_SECURE_MEMORY
+        , .secure_retire_row_valid(memory_retire_row), .secure_retire_row(out_m)
+`endif
     );
 
 `ifdef ENABLE_SECURE_TAGS
     shared_tag_queue #(.ROWS(ROWS), .COLS(COLS), .TAG_WIDTH(TAG_WIDTH)) u_shared_tag_queue (
-        .clk(clk), .reset(reset), .flush(secure_fault_request || trusted_abort), .advance(state == COMPUTE),
+        .clk(clk), .reset(reset), .flush(secure_fault_request || trusted_abort
+`ifdef ENABLE_SECURE_MEMORY
+                                       || memory_zeroize
+`endif
+                                       ), .advance(state == COMPUTE),
         .in_valid(queue_in_valid), .in_tag(queue_in_tag), .tap_valid(tap_valid),
         .tap_tag(tap_tag), .empty(queue_empty)
     );
@@ -318,10 +415,17 @@ module weight_stationary_accelerator #(
         .ROWS(MAX_M), .COLS(MAX_N), .TAG_WIDTH(TAG_WIDTH), .WRITE_PORTS(COLS),
         .ROW_WIDTH(M_WIDTH), .COL_WIDTH(N_WIDTH)
     ) u_secure_obuff_tags (
-        .clk(clk), .reset(reset), .clear_valids((state == IDLE && start && job_accept) || secure_fault_request || trusted_abort),
+        .clk(clk), .reset(reset), .clear_valids((state == IDLE && start && job_accept) || secure_fault_request || trusted_abort
+`ifdef ENABLE_SECURE_MEMORY
+                                             || memory_zeroize
+`endif
+                                             ),
         .write_enable(secure_tag_write_enable), .write_row(obuf_write_row), .write_col(obuf_write_col),
         .write_tag(secure_tag_write_data), .read_row(obuf_read_row), .read_col(obuf_read_col),
         .read_valid(secure_obuff_read_valid), .read_tag(secure_obuff_read_tag)
+`ifdef ENABLE_SECURE_MEMORY
+        , .secure_retire_row_valid(memory_retire_row), .secure_retire_row(out_m)
+`endif
     );
     for (genvar secure_pc = 0; secure_pc < COLS; secure_pc++) begin : G_TAG_POLICY
         tag_policy_resolver #(.TAG_WIDTH(TAG_WIDTH)) u_tag_policy (
@@ -339,7 +443,13 @@ module weight_stationary_accelerator #(
         .ROWS(ROWS), .COLS(COLS), .DATA_WIDTH(DATA_WIDTH),
         .ACC_WIDTH(ACC_WIDTH), .WEIGHTS_PER_PE(WEIGHTS_PER_PE)
     ) u_array (
-        .clk(clk), .reset(reset), .weight_load(state == LOAD),
+        .clk(clk), .reset(
+`ifdef ENABLE_SECURE_MEMORY
+                         memory_zeroize
+`else
+                         reset
+`endif
+                         ), .weight_load(state == LOAD),
         .activation_in(aa), .activation_valid_in(aav),
         .weight_in(aw), .weight_valid_in(awv),
         .weight_slot_in(aslot), .weight_target_row_in(atarget),
@@ -355,6 +465,9 @@ module weight_stationary_accelerator #(
                      m_cfg <= MAX_M && k_cfg <= MAX_K && n_cfg <= MAX_N && inputs_ready;
 `ifdef ENABLE_SECURE_TAGS
         if (security_fault) job_accept = 1'b0;
+`endif
+`ifdef ENABLE_SECURE_MEMORY
+        if (memory_cancel || config_we) job_accept = 1'b0;
 `endif
         state_next = state;
         n_base_next = n_base; kset_base_next = kset_base; bank_next = bank;
@@ -412,12 +525,22 @@ module weight_stationary_accelerator #(
                     out_m_next = 0; out_n_next = 0; state_next = RESULTS;
                 end
             end
+`ifdef ENABLE_SECURE_MEMORY
+            RESULTS: if (memory_retire_row) begin
+                // The adapter has committed the complete encrypted row to
+                // storage. Data and tags retire together on this edge.
+                out_n_next = 0;
+                if (out_m + 1 < m_dim) out_m_next = out_m + 1;
+                else begin done_next = 1'b1; state_next = IDLE; end
+            end
+`else
             RESULTS: if (result_valid && result_ready) begin
                 // Hold coordinates/data until the host accepts this result.
                 if (out_n + 1 < n_dim) out_n_next = out_n + 1;
                 else if (out_m + 1 < m_dim) begin out_m_next = out_m + 1; out_n_next = 0; end
                 else begin done_next = 1'b1; state_next = IDLE; end
             end
+`endif
             default: state_next = IDLE;
         endcase
 `ifdef ENABLE_SECURE_TAGS
@@ -468,7 +591,11 @@ module weight_stationary_accelerator #(
             done <= done_next;
             debug_weight_set_loads <= debug_weight_set_loads_next;
             debug_mac_count <= debug_mac_count_next;
-            if (state == IDLE && config_we) begin
+            if (state == IDLE && config_we
+`ifdef ENABLE_SECURE_MEMORY
+                && config_ready
+`endif
+                ) begin
                 m_cfg <= config_m;
                 k_cfg <= config_k;
                 n_cfg <= config_n;
@@ -481,6 +608,7 @@ module weight_stationary_accelerator #(
                 end
 `endif
             end
+`ifndef ENABLE_SECURE_MEMORY
             if (state == IDLE && a_we && a_row < MAX_M && a_col < MAX_K
 `ifdef ENABLE_SECURE_TAGS
                 && trusted_tag_we && trusted_tag_row == a_row
@@ -496,11 +624,39 @@ module weight_stationary_accelerator #(
                 trusted_row_tag_valid[a_row] <= 1'b1;
                 trusted_row_tag[a_row] <= trusted_tag_data;
             end
-            if (secure_fault_request || trusted_abort) security_fault <= 1'b1;
 `endif
             if (state == IDLE && b_we && b_row < MAX_K && b_col < MAX_N) begin
                 wbuf_v[b_row][b_col] <= 1'b1;
             end
+`else
+            if (memory_a_commit) begin
+                for (c = 0; c < MAX_K; c++)
+                    ibuf_v[trusted_a_commit_row][c] <= c < k_cfg;
+`ifdef ENABLE_SECURE_TAGS
+                trusted_row_tag_valid[trusted_a_commit_row] <= 1'b1;
+                trusted_row_tag[trusted_a_commit_row] <= trusted_a_commit_tenant;
+`endif
+            end
+            if (memory_b_commit)
+                for (c = 0; c < MAX_N; c++)
+                    wbuf_v[trusted_b_commit_row][c] <= c < n_cfg;
+            // Fresh configuration and cancellation erase every readiness bit;
+            // no previous epoch's data can satisfy a new job's start checks.
+            if (memory_zeroize) begin
+                for (r = 0; r < MAX_M; r++) begin
+                    for (c = 0; c < MAX_K; c++) ibuf_v[r][c] <= 1'b0;
+`ifdef ENABLE_SECURE_TAGS
+                    trusted_row_tag_valid[r] <= 1'b0;
+                    trusted_row_tag[r] <= '0;
+`endif
+                end
+                for (r = 0; r < MAX_K; r++)
+                    for (c = 0; c < MAX_N; c++) wbuf_v[r][c] <= 1'b0;
+            end
+`endif
+`ifdef ENABLE_SECURE_TAGS
+            if (secure_fault_request || trusted_abort) security_fault <= 1'b1;
+`endif
    // The controller observes a bottom result one clock after its final PE
    // register update.  At observation cycle t it belongs to m=t-ROWS-c.
    // This explicit coordinate avoids relying on completion order, where
@@ -516,3 +672,4 @@ module weight_stationary_accelerator #(
         end
     end
 endmodule
+

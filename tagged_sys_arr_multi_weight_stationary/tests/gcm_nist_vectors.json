@@ -1,0 +1,10 @@
+{
+  "source": "https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Standards-and-Guidelines/documents/examples/AES_GCM.pdf",
+  "description": "NIST GCM-AES128 and GCM-AES256 examples 1 and 5, 96-bit IV and 128-bit tag.",
+  "vectors": [
+    {"name":"nist-aes128-example1","key":"feffe9928665731c6d6a8f9467308308","iv":"cafebabefacedbaddecaf888","aad":"","plaintext":"","ciphertext":"","tag":"3247184b3c4f69a44dbcd22887bbb418"},
+    {"name":"nist-aes128-example5","key":"feffe9928665731c6d6a8f9467308308","iv":"cafebabefacedbaddecaf888","aad":"3ad77bb40d7a3660a89ecaf32466ef97f5d3d585","plaintext":"d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39","ciphertext":"42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091","tag":"f07c2528eea2fca1211f905e1b6a881b"},
+    {"name":"nist-aes256-example1","key":"feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308","iv":"cafebabefacedbaddecaf888","aad":"","plaintext":"","ciphertext":"","tag":"fd2caa16a5832e76aa132c1453eeda7e"},
+    {"name":"nist-aes256-example5","key":"feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308","iv":"cafebabefacedbaddecaf888","aad":"3ad77bb40d7a3660a89ecaf32466ef97f5d3d585","plaintext":"d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39","ciphertext":"522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f662","tag":"e097195f4532da895fb917a5a55c6aa0"}
+  ]
+}

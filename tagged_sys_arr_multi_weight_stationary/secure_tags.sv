@@ -67,6 +67,10 @@ module secure_obuff_tag_store #(
     input logic [COL_WIDTH-1:0] read_col [0:WRITE_PORTS],
     output logic read_valid [0:WRITE_PORTS],
     output logic [TAG_WIDTH-1:0] read_tag [0:WRITE_PORTS]
+`ifdef ENABLE_SECURE_MEMORY
+    , input logic secure_retire_row_valid,
+    input logic [ROW_WIDTH-1:0] secure_retire_row
+`endif
 );
     logic valid [0:ROWS-1][0:COLS-1];
     logic [TAG_WIDTH-1:0] tag [0:ROWS-1][0:COLS-1];
@@ -79,6 +83,13 @@ module secure_obuff_tag_store #(
             for (int r = 0; r < ROWS; r++) for (int c = 0; c < COLS; c++) begin
                 valid[r][c] <= 1'b0; tag[r][c] <= '0;
             end
+`ifdef ENABLE_SECURE_MEMORY
+        end else if (secure_retire_row_valid && secure_retire_row < ROWS) begin
+            for (int c = 0; c < COLS; c++) begin
+                valid[secure_retire_row][c] <= 1'b0;
+                tag[secure_retire_row][c] <= '0;
+            end
+`endif
         end else for (int p = 0; p < WRITE_PORTS; p++) if (write_enable[p]) begin
             valid[write_row[p]][write_col[p]] <= 1'b1;
             tag[write_row[p]][write_col[p]] <= write_tag[p];

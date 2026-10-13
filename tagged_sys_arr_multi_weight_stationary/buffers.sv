@@ -101,6 +101,13 @@ module multi_read_matrix_buffer #(
     input logic [ROW_WIDTH-1:0] read_row [0:READ_PORTS-1],
     input logic [COL_WIDTH-1:0] read_col [0:READ_PORTS-1],
     output logic signed [DATA_WIDTH-1:0] read_data [0:READ_PORTS-1]
+`ifdef ENABLE_SECURE_MEMORY
+    , input logic secure_clear,
+    input logic secure_row_commit,
+    input logic [ROW_WIDTH-1:0] secure_row,
+    input logic [31:0] secure_row_words,
+    input logic [COLS*DATA_WIDTH-1:0] secure_row_data
+`endif
 );
     logic signed [DATA_WIDTH-1:0] data [0:ROWS-1][0:COLS-1];
 
@@ -109,7 +116,20 @@ module multi_read_matrix_buffer #(
     end
 
     always_ff @(posedge clk) begin
+`ifdef ENABLE_SECURE_MEMORY
+        // Atomic publication writes the complete authenticated row and erases
+        // every unused tail word. Scalar legacy writes are disabled here.
+        if (secure_clear) begin
+            for (int row = 0; row < ROWS; row++)
+                for (int col = 0; col < COLS; col++) data[row][col] <= '0;
+        end else if (secure_row_commit && secure_row < ROWS) begin
+            for (int col = 0; col < COLS; col++)
+                data[secure_row][col] <= col < secure_row_words ?
+                    secure_row_data[COLS*DATA_WIDTH-1-col*DATA_WIDTH -: DATA_WIDTH] : '0;
+        end
+`else
         if (write_enable) data[write_row][write_col] <= write_data;
+`endif
     end
 endmodule
 
@@ -139,6 +159,10 @@ module multi_write_output_buffer #(
     output logic signed [ACC_WIDTH-1:0] read_data [0:READ_PORTS-1],
     output logic read_valid [0:READ_PORTS-1],
     output logic read_final [0:READ_PORTS-1]
+`ifdef ENABLE_SECURE_MEMORY
+    , input logic secure_retire_row_valid,
+    input logic [ROW_WIDTH-1:0] secure_retire_row
+`endif
 );
     logic signed [ACC_WIDTH-1:0] data [0:ROWS-1][0:COLS-1];
     logic valid [0:ROWS-1][0:COLS-1];
@@ -156,7 +180,18 @@ module multi_write_output_buffer #(
                 for (int col = 0; col < COLS; col++) begin
                     valid[row][col] <= 1'b0;
                     final_valid[row][col] <= 1'b0;
+`ifdef ENABLE_SECURE_MEMORY
+                    data[row][col] <= '0;
+`endif
                 end
+`ifdef ENABLE_SECURE_MEMORY
+        end else if (secure_retire_row_valid && secure_retire_row < ROWS) begin
+            for (int col = 0; col < COLS; col++) begin
+                data[secure_retire_row][col] <= '0;
+                valid[secure_retire_row][col] <= 1'b0;
+                final_valid[secure_retire_row][col] <= 1'b0;
+            end
+`endif
         end else begin
             for (int port = 0; port < WRITE_PORTS; port++) begin
                 if (write_enable[port]) begin
@@ -168,3 +203,4 @@ module multi_write_output_buffer #(
         end
     end
 endmodule
+

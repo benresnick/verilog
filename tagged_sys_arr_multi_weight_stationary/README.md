@@ -13,9 +13,13 @@ storage, activations move left-to-right, and partial sums move top-to-bottom.
 The tagged build proves that each live partial sum and final result remains
 associated with the trusted tag assigned to its source activation row.
 
-> This is a metadata-propagation and enforcement prototype, not an encryption
-> engine. Numerical data remains plaintext in this RTL. A future trusted egress
-> block can use the final tag to select an encryption context.
+> The accelerator's memory and result interfaces still carry plaintext.
+> AES-GCM includes quarantined authenticated decryption. A trusted wrapper now
+> connects three crypto paths to protected tenant keys, automatic encryption
+> IV reservation, and authenticated record metadata. Accelerator buffer/tag
+> adapters and DRAM record commit are not yet connected. See
+> [crypto implementation status](docs/crypto-primitives.md) for their contracts
+> and the remaining integration work.
 
 ## What the protected tag plane does
 
@@ -110,12 +114,22 @@ the entire 96-bit value as opaque metadata.
 | `buffers.sv` | IBuff, WBuff, and numerical OBuff primitives. |
 | `secure_tagging_tb.sv` | End-to-end multi-user, tiling, fault, reset, abort, and randomized regression. |
 | `secure_tags_tb.sv` | Unit tests for policy resolution, queue timing, and tag-store concurrency. |
+| `tenant_key_regfile.sv`, `tenant_key_regfile_tb.sv` | Trusted key provisioning, lookup, IV reservation, and adversarial unit tests. |
+| `aes_primitives.sv`, `aes_key_expand.sv`, `aes_encrypt_block.sv` | Pipelined forward AES-128/256 and rolling key expansion. |
+| `aes_encrypt_block_tb.sv` | Independent AES vectors, throughput, backpressure, and zeroization checks. |
+| `gf128_mul.sv`, `ghash_core.sv`, `ghash_core_tb.sv` | Ordered wide GHASH primitive and independent arithmetic/NIST-vector tests. |
+| `gctr_core.sv`, `gctr_core_tb.sv` | Wide pipelined counter transform, partial bytes, counter limits, and independent vectors. |
+| `aes_gcm_engine.sv`, `aes_gcm_engine_tb.sv` | Bounded AES-GCM encryption/decryption, AAD framing, quarantine, and adversarial stream tests. |
+| `tests/run_gcm.py`, `tests/run_gcm_negative.py` | Independent OpenSSL EVP GCM oracle and invalid-configuration checks. |
+| `tenant_gcm_port.sv`, `tenant_gcm_cluster.sv` | Three trusted tenant-aware crypto paths, shared key management, fresh encryption IVs, and automatic authenticated metadata. |
+| `tenant_gcm_cluster_tb.sv`, `tests/run_tenant_gcm.py`, `tests/run_tenant_gcm_negative.py` | Independent record oracle, concurrent tenants, key lifecycle/nonce races, tampering, and negative controls. |
 | `weight_stationary_accelerator_tb.sv` | Original numerical end-to-end regression. |
 | `docs/shared-tag-queue-timing.png` | The shared-queue timing diagram used above. |
 
 ## Build and verification
 
-Requires Icarus Verilog with SystemVerilog support.
+Requires Icarus Verilog with SystemVerilog support. GCM tests also require
+Python 3 and a shared OpenSSL `libcrypto`; no third-party Python packages.
 
 ```sh
 cd tagged_sys_arr_multi_weight_stationary
@@ -130,13 +144,31 @@ make tagged
 # Tagged shape/weight sweep: 1x1, 1x4, 2x2 W=1/W=4, 3x5, and 4x3.
 make tagged-sweep
 
+# Key file, AES, GHASH, GCTR, and independent AES-GCM verification.
+make test-crypto
+
+# GCM-only oracle/tamper/framing suite and 4096-bit bus smoke sweep.
+make test-gcm
+make test-gcm-wide
+
+# Trusted key/nonce integration and three independent crypto paths.
+make test-tenant-gcm
+make test-tenant-gcm-mutations
+
 # Compile-only checks for both elaborations.
 make lint
 make tagged-lint
 
 # Complete repository-local verification gate.
 make full-ci
+
+# Extended independent oracles, parameter/stress campaigns, and mutation checks.
+# Also requires the OpenSSL CLI; no Python packages or network access.
+make rigorous-ci
 ```
+
+The [verification matrix](docs/verification.md) lists the per-module checks,
+reproduction commands, and limits of simulation coverage.
 
 The secure suite covers one, two, three, and per-row-distinct users; K and N
 tiling; partial N tiles; resident-weight banks; full capacities; back-to-back
@@ -162,7 +194,10 @@ not change queue depth or tap positions for a single compute pass.
 
 ## Limitations and intended next integration
 
-- This implementation does not encrypt, decrypt, authenticate, or derive keys.
+- The accelerator does not yet encrypt or authenticate its memory transfers.
+  The crypto cluster now includes protected key/nonce handling, authenticated
+  metadata, three private engines, and decryption quarantine. DRAM record
+  framing and atomic authenticated buffer/tenant-tag commit still need wiring.
 - Architectural connectivity prevents ordinary software from using tags; it
   does not address physical probing, scan access, fault injection, or
   side-channel leakage.
