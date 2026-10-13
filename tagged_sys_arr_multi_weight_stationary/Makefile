@@ -10,6 +10,29 @@ SECURE_MEMORY_RTL = $(RTL) $(TENANT_GCM_RTL) authenticated_row_stager.sv secure_
 .PHONY: test-gctr test-gcm test-gcm-wide test-gcm-negative test-gcm-mutations gcm-lint
 .PHONY: test-tenant-gcm test-tenant-gcm-negative test-tenant-gcm-mutations tenant-gcm-lint
 .PHONY: test-row-stager test-secure-memory test-secure-memory-negative test-secure-memory-mutations secure-memory-lint
+.PHONY: verilator-lint
+
+# Verified with Icarus Verilog 13.0. Icarus 12.0 as packaged by Ubuntu 24.04
+# drops values passed out through unpacked-array output ports (the bottom-edge
+# psum valid from sysarr reads X), which hangs run-w1 in DRAIN.
+IVERILOG_MAJOR := $(shell iverilog -V 2>&1 | sed -n 's/^Icarus Verilog version \([0-9][0-9]*\).*/\1/p' | head -n 1)
+ifneq ($(IVERILOG_MAJOR),)
+ifeq ($(shell test $(IVERILOG_MAJOR) -lt 13 && echo old),old)
+$(warning Icarus Verilog $(IVERILOG_MAJOR).x found; this suite is verified with 13.0. If run-w1 hangs in DRAIN, upgrade Icarus.)
+endif
+endif
+
+# Verilator lint for all three elaborations. Width/unused style warnings
+# (32-bit integer scheduler counters) are excluded; everything else fails,
+# apart from the documented, narrowly scoped waivers in verilator_waivers.vlt.
+VERILATOR_LINT = verilator --lint-only -Wall -Wno-WIDTH -Wno-UNUSED -Wno-PINCONNECTEMPTY \
+	-Wno-GENUNNAMED -Wno-DECLFILENAME -Wno-MULTITOP verilator_waivers.vlt
+verilator-lint:
+	$(VERILATOR_LINT) --top-module weight_stationary_accelerator $(RTL)
+	$(VERILATOR_LINT) -DENABLE_SECURE_TAGS --top-module weight_stationary_accelerator $(RTL)
+	$(VERILATOR_LINT) -DENABLE_SECURE_TAGS -DENABLE_SECURE_MEMORY --top-module secure_memory_accelerator $(SECURE_MEMORY_RTL)
+	@echo "PASS: Verilator lint (plain, tagged, secure-memory)"
+
 test-pe:
 	iverilog -g2012 -s pe_tb -o /tmp/ws_pe_tb pe.sv pe_tb.sv && vvp /tmp/ws_pe_tb
 test-buffers:
