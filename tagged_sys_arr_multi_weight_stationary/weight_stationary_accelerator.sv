@@ -191,6 +191,20 @@ module weight_stationary_accelerator #(
     // Host writes are only accepted while idle.  Result transfers are the
     // exception: they occur in RESULTS with their own ready/valid handshake.
     assign busy = (state != IDLE);
+
+    // One accept term per host write, used for BOTH the buffer write port and
+    // the controller's valid/tag state, so outside reset the two agree.  The
+    // coordinate ports are wide enough to encode MAX itself (and beyond), so
+    // every write is range-checked here: without it, simulation silently
+    // drops an out-of-range write while synthesis truncates the address and
+    // overwrites a real row.
+    wire config_accept = config_we && config_ready;
+    wire a_write_accept = a_we && a_ready && a_row < MAX_M && a_col < MAX_K
+`ifdef ENABLE_SECURE_TAGS
+                          && trusted_tag_we && trusted_tag_row == a_row
+`endif
+                          ;
+    wire b_write_accept = b_we && b_ready && b_row < MAX_K && b_col < MAX_N;
 `ifdef ENABLE_SECURE_MEMORY
     assign config_ready = (state == IDLE) && !memory_cancel;
     assign a_ready = 1'b0;
@@ -348,11 +362,7 @@ module weight_stationary_accelerator #(
         .ROWS(MAX_M), .COLS(MAX_K), .DATA_WIDTH(DATA_WIDTH), .READ_PORTS(ROWS),
         .ROW_WIDTH(M_WIDTH), .COL_WIDTH(K_WIDTH)
     ) u_ibuff (
-        .clk(clk), .write_enable(a_we && a_ready
-`ifdef ENABLE_SECURE_TAGS
-                                  && trusted_tag_we && trusted_tag_row == a_row
-`endif
-                                  ),
+        .clk(clk), .write_enable(a_write_accept),
         .write_row(a_row), .write_col(a_col), .write_data(a_data),
         .read_row(ibuf_read_row), .read_col(ibuf_read_col), .read_data(ibuf_read_data)
 `ifdef ENABLE_SECURE_MEMORY
@@ -367,7 +377,7 @@ module weight_stationary_accelerator #(
         .ROWS(MAX_K), .COLS(MAX_N), .DATA_WIDTH(DATA_WIDTH), .READ_PORTS(COLS),
         .ROW_WIDTH(K_WIDTH), .COL_WIDTH(N_WIDTH)
     ) u_wbuff (
-        .clk(clk), .write_enable(b_we && b_ready),
+        .clk(clk), .write_enable(b_write_accept),
         .write_row(b_row), .write_col(b_col), .write_data(b_data),
         .read_row(wbuf_read_row), .read_col(wbuf_read_col), .read_data(wbuf_read_data)
 `ifdef ENABLE_SECURE_MEMORY
@@ -383,10 +393,10 @@ module weight_stationary_accelerator #(
         .ROW_WIDTH(M_WIDTH), .COL_WIDTH(N_WIDTH)
     ) u_obuf (
         .clk(clk), .reset(reset),
-        .clear_valids((state == IDLE && start && m_cfg != 0 && k_cfg != 0 && n_cfg != 0 &&
-                      m_cfg <= MAX_M && k_cfg <= MAX_K && n_cfg <= MAX_N && inputs_ready)
+        // Same accept term as the controller.
+        .clear_valids((state == IDLE && start && job_accept)
 `ifdef ENABLE_SECURE_TAGS
-                      || secure_fault_request
+                      || secure_fault_request || trusted_abort
 `endif
 `ifdef ENABLE_SECURE_MEMORY
                       || memory_zeroize
@@ -513,6 +523,10 @@ module weight_stationary_accelerator #(
                 // partials for this bank reached OBuff.
                 if (!last_bank_in_set) begin
                     bank_next = bank + 1; pass_cycle_next = 0; commits_next = 0;
+                    // Recompute for the new bank: a set's final bank may be
+                    // partial, and debug_mac_count must count only real rows.
+                    active_rows_next = ((k_dim - (kset_base + (bank + 1) * ROWS)) < ROWS) ?
+                                       (k_dim - (kset_base + (bank + 1) * ROWS)) : ROWS;
                     state_next = COMPUTE;
                 end else if (kset_base + KR < k_dim) begin
                     kset_base_next = kset_base + KR; bank_next = 0; load_issue_next = 0;
@@ -591,11 +605,7 @@ module weight_stationary_accelerator #(
             done <= done_next;
             debug_weight_set_loads <= debug_weight_set_loads_next;
             debug_mac_count <= debug_mac_count_next;
-            if (state == IDLE && config_we
-`ifdef ENABLE_SECURE_MEMORY
-                && config_ready
-`endif
-                ) begin
+            if (state == IDLE && config_accept) begin
                 m_cfg <= config_m;
                 k_cfg <= config_k;
                 n_cfg <= config_n;
@@ -605,29 +615,32 @@ module weight_stationary_accelerator #(
                 for (r = 0; r < MAX_M; r++) begin
                     trusted_row_tag_valid[r] <= 1'b0;
                     trusted_row_tag[r] <= '0;
+`ifndef ENABLE_SECURE_MEMORY
+                    // The A elements themselves belong to the old epoch too.
+                    // Without this, a new owner could bind a row with one
+                    // write and inherit the previous owner's other elements.
+                    // (The secure-memory build erases them via memory_zeroize.)
+                    for (c = 0; c < MAX_K; c++) ibuf_v[r][c] <= 1'b0;
+`endif
                 end
 `endif
             end
 `ifndef ENABLE_SECURE_MEMORY
-            if (state == IDLE && a_we && a_row < MAX_M && a_col < MAX_K
+            // Placed after the configure block: an A write on the same edge as
+            // a configure belongs to the new epoch, matching its tag binding.
+            if (a_write_accept) ibuf_v[a_row][a_col] <= 1'b1;
 `ifdef ENABLE_SECURE_TAGS
-                && trusted_tag_we && trusted_tag_row == a_row
-`endif
-                ) begin
-                ibuf_v[a_row][a_col] <= 1'b1;
-            end
-`ifdef ENABLE_SECURE_TAGS
-            if (state == IDLE && a_we && trusted_tag_we && trusted_tag_row == a_row &&
-                a_row < MAX_M && a_col < MAX_K) begin
-                if (trusted_row_tag_valid[a_row] && trusted_row_tag[a_row] != trusted_tag_data)
+            if (a_write_accept) begin
+                // On a configure edge the stored tag belongs to the old epoch
+                // being erased, so it cannot conflict with the new binding.
+                if (trusted_row_tag_valid[a_row] && trusted_row_tag[a_row] != trusted_tag_data &&
+                    !(state == IDLE && config_accept))
                     security_fault <= 1'b1;
                 trusted_row_tag_valid[a_row] <= 1'b1;
                 trusted_row_tag[a_row] <= trusted_tag_data;
             end
 `endif
-            if (state == IDLE && b_we && b_row < MAX_K && b_col < MAX_N) begin
-                wbuf_v[b_row][b_col] <= 1'b1;
-            end
+            if (b_write_accept) wbuf_v[b_row][b_col] <= 1'b1;
 `else
             if (memory_a_commit) begin
                 for (c = 0; c < MAX_K; c++)
@@ -671,5 +684,33 @@ module weight_stationary_accelerator #(
             end
         end
     end
+
+`ifndef SYNTHESIS
+    // Scheduler invariants (simulation only; $fatal so every make target fails).
+    // All commits of a bank land by the final COMPUTE cycle, so DRAIN lasts
+    // exactly one cycle; a longer DRAIN means a lost or misattributed commit
+    // (the hardware would otherwise wait in DRAIN forever).
+    state_t previous_state;
+    always @(posedge clk) begin
+        if (!reset) begin
+            if (state == COMPUTE || state == DRAIN)
+                assert (commits <= m_dim * active_cols)
+                    else $fatal(1, "controller: %0d commits exceed M*active_cols=%0d", commits, m_dim * active_cols);
+            if (state == DRAIN && previous_state == DRAIN)
+                $fatal(1, "controller: DRAIN stalled with %0d of %0d commits", commits, m_dim * active_cols);
+            // Diagonal bottom-edge commits must target distinct OBuff entries
+            // (the buffer itself would silently let the higher port win).
+            for (int port = 0; port < COLS; port++)
+                for (int other = port + 1; other < COLS; other++)
+                    if (obuf_write_enable[port] && obuf_write_enable[other])
+                        assert (obuf_write_row[port] != obuf_write_row[other] ||
+                                obuf_write_col[port] != obuf_write_col[other])
+                            else $fatal(1, "controller: OBuff ports %0d and %0d both commit [%0d][%0d]",
+                                        port, other, obuf_write_row[port], obuf_write_col[port]);
+        end
+        if (reset) previous_state <= IDLE;
+        else previous_state <= state;
+    end
+`endif
 endmodule
 

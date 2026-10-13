@@ -81,6 +81,59 @@ module secure_tagging_tb;
   load(1,1,1,1,63);step;start=1;step;start=0;wait(phase==2);step;trusted_abort=1;@(posedge clk);step;trusted_abort=0;
   if(!security_fault||result_valid)$fatal(1,"trusted abort did not suppress output");passed++;$display("[PASS] trusted abort flushes work");
  end endtask
+ // A new configuration epoch must not let a new owner bind a row with one
+ // write and inherit the previous owner's remaining A elements.
+ task automatic epoch_isolation; begin
+  if(MAX_K>=2) begin
+   load(1,2,1,0,201);
+   step;config_we=1;config_m=1;config_k=2;config_n=1;step;config_we=0;
+   step;a_we=1;a_row=0;a_col=0;a_data=1;trusted_tag_we=1;trusted_tag_row=0;trusted_tag_data=96'h9999;step;a_we=0;trusted_tag_we=0;
+   step;start=1;step;start=0;@(posedge clk);
+   if(!job_error||busy||security_fault)$fatal(1,"new epoch inherited the previous owner's A elements");
+   passed++;$display("[PASS] new configuration epoch cannot inherit a previous owner's A elements");
+  end else $display("[SKIP] epoch isolation needs MAX_K >= 2");
+ end endtask
+ // Configure and rebind row 0 to a new owner on the same clock edge: the old
+ // epoch's tag must not raise a false conflict, and the result is the new owner's.
+ task automatic same_edge_epoch_binding; integer lim,count; begin
+  load(1,1,1,0,202);
+  step;config_we=1;config_m=1;config_k=1;config_n=1;
+  a_we=1;a_row=0;a_col=0;a_data=5;trusted_tag_we=1;trusted_tag_row=0;trusted_tag_data=96'h7777;
+  step;config_we=0;a_we=0;trusted_tag_we=0;
+  if(security_fault)$fatal(1,"same-edge configure and binding faulted on the old epoch's tag");
+  step;start=1;step;start=0;lim=0;count=0;
+  while(!done&&lim<1000) begin @(negedge clk);@(posedge clk);
+   if(result_valid&&result_ready) begin
+    if(trusted_result_tag!==96'h7777||result_data!==32'(5*bm[0][0]))$fatal(1,"same-edge epoch result has wrong owner or data");
+    count++;
+   end
+   lim++;#1;
+  end
+  if(!done||count!=1||security_fault)$fatal(1,"same-edge epoch job did not complete");
+  passed++;$display("[PASS] configure and A binding on the same edge start a clean epoch");
+ end endtask
+ // Coordinates are wide enough to encode MAX and beyond.  Such writes must
+ // never reach a buffer write port (synthesis would alias them onto real rows)
+ // and must not bind a tag or fault.
+ logic oob_port_write=0;
+ always @(posedge clk) if(!reset) begin
+  if(dut.u_ibuff.write_enable&&(dut.u_ibuff.write_row>=MAX_M||dut.u_ibuff.write_col>=MAX_K)) oob_port_write<=1;
+  if(dut.u_wbuff.write_enable&&(dut.u_wbuff.write_row>=MAX_K||dut.u_wbuff.write_col>=MAX_N)) oob_port_write<=1;
+ end
+ task automatic out_of_range_writes; begin
+  step;config_we=1;config_m=1;config_k=1;config_n=1;step;config_we=0;
+  if((1<<MW)>MAX_M) begin step;a_we=1;a_row=MAX_M;a_col=0;a_data=7;trusted_tag_we=1;trusted_tag_row=MAX_M;trusted_tag_data=96'h5;step;a_we=0;trusted_tag_we=0; end
+  if((1<<KW)>MAX_K) begin step;a_we=1;a_row=0;a_col=MAX_K;a_data=7;trusted_tag_we=1;trusted_tag_row=0;trusted_tag_data=96'h5;step;a_we=0;trusted_tag_we=0;
+                          step;b_we=1;b_row=MAX_K;b_col=0;b_data=7;step;b_we=0; end
+  if((1<<NW)>MAX_N) begin step;b_we=1;b_row=0;b_col=MAX_N;b_data=7;step;b_we=0; end
+  @(posedge clk);#1;
+  // The port monitor is the real check: simulation drops an out-of-range array
+  // index, so only a write that reaches a buffer port could alias in silicon.
+  if(oob_port_write)$fatal(1,"out-of-range host write reached a buffer write port");
+  // The a_col=MAX_K write named a legal row: it must not bind that row's tag.
+  if(dut.trusted_row_tag_valid[0]||security_fault)$fatal(1,"out-of-range host write bound a tag or faulted");
+  passed++;$display("[PASS] out-of-range host writes are dropped before the buffers");
+ end endtask
  // Tagged invariants: these inspect only internal trusted state and never
  // print payloads.  Fault-injection cycles are excluded deliberately.
  always @(posedge clk) if(!reset) begin
@@ -109,6 +162,7 @@ module secure_tagging_tb;
  end
  initial begin
   passed=0;clean_reset();no_tag();clean_reset();ingress_fault();clean_reset();
+  out_of_range_writes();clean_reset();epoch_isolation();clean_reset();same_edge_epoch_binding();clean_reset();
   if($value$plusargs("stress_iters=%d",stress_iters))begin end
   if($value$plusargs("seed=%d",seed))begin end
   rng=seed;

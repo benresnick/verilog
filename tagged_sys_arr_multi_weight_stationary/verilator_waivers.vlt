@@ -1,0 +1,18 @@
+`verilator_config
+// Each waiver names one file (and, where Verilator allows, one signal), with
+// the reason it is benign.
+// Anything else Verilator reports (including a new combinational loop) fails
+// `make verilator-lint`.
+
+// GHASH: chain[lane+1] depends on chain[lane]. That is a feed-forward
+// chain, but Verilator analyses the array as a single signal and sees a loop.
+lint_off -rule UNOPTFLAT -file "*ghash_core.sv" -match "*hash.chain*"
+// Key file: the IV reservation inputs and the tenant lookup outputs share one
+// always_comb block, but the lookups never read reserve_iv_* (see the
+// "reserve -> grant -> ready is feed-forward" note in tenant_gcm_cluster.sv).
+lint_off -rule UNOPTFLAT -file "*tenant_key_regfile.sv" -match "*reserve_iv_slot*"
+lint_off -rule UNOPTFLAT -file "*tenant_gcm_cluster.sv" -match "*reserve_iv_valid*"
+// With one 128-bit lane, the defensive in_blocks > LANES check is constant.
+lint_off -rule CMPCONST -file "*ghash_core.sv"
+// 'abort' is a port name; it would only clash with C++ in a Verilator model.
+lint_off -rule SYMRSVDWORD -file "*secure_memory_accelerator.sv"

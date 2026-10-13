@@ -169,9 +169,9 @@ module secure_memory_accelerator_tb #(
         for(int c=0;c<MAX_N;c++) begin
             expected_word=0;
             if(!erased && c<n) expected_word=c_plain[r][ACC_WIDTH*(n-1-c)+:ACC_WIDTH];
-            ck(dut.core.u_obuff.data[r][c]===expected_word,
+            ck(dut.core.u_obuf.data[r][c]===expected_word,
                 erased?"successful storage acknowledgement zeroizes whole output row":"complete plaintext row and tenant tags survive until matching successful storage acknowledgement");
-            ck(dut.core.u_obuff.valid[r][c]===1'(!erased && c<n) && dut.core.u_obuff.final_valid[r][c]===1'(!erased && c<n),
+            ck(dut.core.u_obuf.valid[r][c]===1'(!erased && c<n) && dut.core.u_obuf.final_valid[r][c]===1'(!erased && c<n),
                 "output data-valid bits retire atomically as a complete row");
             ck(dut.core.u_secure_obuff_tags.valid[r][c]===1'(!erased && c<n) &&
                 dut.core.u_secure_obuff_tags.tag[r][c]===(!erased && c<n?tenant[1+r%2]:96'b0),
@@ -221,11 +221,13 @@ module secure_memory_accelerator_tb #(
         #1;ck(config_ready,"idle adapter accepts next trusted shape epoch");
         @(posedge clk);#2;
         ck(!config_error,"valid configured dimensions accepted");
+        // Specific epoch check first, so a stale-epoch bug is named precisely.
+        for(int r=0;r<MAX_M;r++) for(int c=0;c<MAX_K;c++)
+            ck(!dut.core.ibuf_v[r][c],"fresh configuration erases every data-valid entry");
+        for(int r=0;r<MAX_K;r++) for(int c=0;c<MAX_N;c++)
+            ck(!dut.core.wbuf_v[r][c],"fresh configuration erases every data-valid entry");
         clear_models();check_inputs();
-        for(int r=0;r<MAX_M;r++) begin
-            for(int c=0;c<MAX_K;c++) ck(!dut.core.ibuf_v[r][c],"fresh configuration erases every data-valid entry");
-            check_c_row(r,1);
-        end
+        for(int r=0;r<MAX_M;r++) check_c_row(r,1);
         @(negedge clk);config_valid=0;
     endtask
     task automatic start_job(input bit expect_success);
@@ -443,8 +445,10 @@ module secure_memory_accelerator_tb #(
             store_ack_cookie=use_stale_cookie?stale_cookie:~seen_cookie;
             #1;ck(store_ack_ready,"record waits for a trusted durable-storage acknowledgement");
             @(posedge clk);#2;
-            check_c_row(row_number,0);
+            // Name the root cause first: a consumed wrong-cookie ACK would also
+            // erase the row, which check_c_row reports less specifically.
             ck(store_ack_ready&&!store_result_valid&&!done,"mismatched storage cookie cannot retire row");
+            check_c_row(row_number,0);
             @(negedge clk);
         end
         store_ack_valid=0;
@@ -484,3 +488,140 @@ module secure_memory_accelerator_tb #(
             @(negedge clk);store_result_ready=0;
         end
     endtask
+
+    // Fixture layout (tests/run_secure_memory.py): shape count; three
+    // "tenant key iv_fixed" key-slot lines; then per shape "m k n", m A-record
+    // lines, k B-record lines, and per C row its plaintext followed by the
+    // OpenSSL ciphertext/header for each of COUNTERS nonce values.
+    task automatic read_shape(input int fd);
+        int rc;
+        logic [MAX_N*ACC_WIDTH-1:0] c_cipher_line;
+        logic [255:0] c_header_line;
+        rc=$fscanf(fd,"%d %d %d\n",m,k,n);
+        ck(rc==3 && m>=1 && m<=MAX_M && k>=1 && k<=MAX_K && n>=1 && n<=MAX_N,"fixture shape fits the testbench capacities");
+        for(int r=0;r<MAX_M;r++) begin
+            a_plain[r]=0;a_cipher[r]=0;a_alt_plain[r]=0;a_alt_cipher[r]=0;a_header[r]=0;a_alt_header[r]=0;c_plain[r]=0;
+            for(int t=0;t<COUNTERS;t++) begin c_cipher[r][t]=0;c_header[r][t]=0; end
+        end
+        for(int r=0;r<MAX_K;r++) begin
+            b_plain[r]=0;b_cipher[r]=0;b_alt_plain[r]=0;b_alt_cipher[r]=0;b_header[r]=0;b_alt_header[r]=0;
+        end
+        for(int r=0;r<m;r++) begin
+            rc=$fscanf(fd,"%h %h %h %h %h %h\n",a_plain[r],a_header[r],a_cipher[r],a_alt_plain[r],a_alt_header[r],a_alt_cipher[r]);
+            ck(rc==6,"fixture A record line parses");
+        end
+        for(int r=0;r<k;r++) begin
+            rc=$fscanf(fd,"%h %h %h %h %h %h\n",b_plain[r],b_header[r],b_cipher[r],b_alt_plain[r],b_alt_header[r],b_alt_cipher[r]);
+            ck(rc==6,"fixture B record line parses");
+        end
+        for(int r=0;r<m;r++) begin
+            rc=$fscanf(fd,"%h\n",c_plain[r]);
+            ck(rc==1,"fixture C plaintext line parses");
+            for(int t=0;t<COUNTERS;t++) begin
+                // Icarus cannot scan into a 2-D array element directly.
+                rc=$fscanf(fd,"%h %h\n",c_cipher_line,c_header_line);
+                ck(rc==2,"fixture C ciphertext/header line parses");
+                c_cipher[r][t]=c_cipher_line;c_header[r][t]=c_header_line;
+            end
+        end
+    endtask
+
+    // Every authenticated-record fault on both ports at once. Codes are the
+    // ones load_records understands; 7 (wrong-but-valid row) needs a second
+    // row, and 10 (unknown tenant) only applies to A because B must be public.
+    task automatic reject_bad_records();
+        int codes[$];
+        int fa,fb;
+        codes={1,2,3,4,5,6,7,8,9,10,11};
+        foreach(codes[i]) begin
+            fa=codes[i];fb=codes[i];
+            if(fa==7&&m<2) fa=1;
+            if(fb==7&&k<2) fb=1;
+            if(fb==10) fb=11;
+            load_records(2'b11,0,0,fa,fb,0,-1,0);
+        end
+    endtask
+
+    task automatic store_all_rows();
+        logic [COOKIE_W-1:0] first_cookie,cookie;
+        int done_before;
+        done_before=done_count;
+        for(int r=0;r<m;r++) begin
+            if(r==0) begin
+                // Rejected storage, then a cleared attempt, then success while a
+                // stale acknowledgement from the first attempt is replayed.
+                store_attempt(r,1,'0,0,first_cookie);
+                store_attempt(r,2,'0,0,cookie);
+                store_attempt(r,0,first_cookie,1,cookie);
+            end else store_attempt(r,0,'0,0,cookie);
+        end
+        repeat(4) @(posedge clk);
+        #2;
+        ck(done_count==done_before+1,"done pulses exactly once, after the last row's successful acknowledgement");
+        ck(!busy,"accelerator and adapters return idle after the final retirement");
+        for(int r=0;r<m;r++) ck(retired[r],"every output row retired");
+    endtask
+
+    task automatic run_job(input bit lifecycle);
+        int saved1,saved2;
+        configure_job();
+        start_job(0);
+        reject_bad_records();
+        load_records(2'b11,0,0,0,0,1,-1,0);
+        for(int p=0;p<2;p++)
+            for(int phase=1;phase<=3;phase++)
+                load_records(2'b01<<p,0,0,0,0,0,p,phase);
+        load_whole_job();
+        start_job(1);
+        store_all_rows();
+        if(lifecycle) begin
+            // Runs after real outputs, so nonce counters and cookies are non-zero.
+            // 1) A fresh configuration discards the completed job's fully loaded
+            //    epoch (no reset/abort in between): start must be refused.
+            configure_job();
+            start_job(0);
+            // 2) Reset wipes the key file; re-provision from the persisted
+            //    counters so no key/IV pair is ever reused (lifecycle contract).
+            load_whole_job();
+            saved1=nonce_next[1];saved2=nonce_next[2];
+            ck(saved1>0&&saved2>0,"lifecycle checks run with non-zero consumed nonces");
+            cancel_all(1);
+            provision_all(saved1,saved2);
+            // 3) Abort mid-compute preserves keys, consumed nonces and cookies.
+            configure_job();
+            load_whole_job();
+            start_job(1);
+            repeat(3) @(posedge clk);
+            cancel_all(0);
+            // 4) The next job completes normally on the advanced counters.
+            configure_job();
+            load_whole_job();
+            start_job(1);
+            store_all_rows();
+        end
+    endtask
+
+    initial begin : main
+        int fd,rc,shapes;
+        if(!$value$plusargs("vectors=%s",fixture_path)) $fatal(1,"SECURE_MEMORY missing +vectors=<fixture>");
+        fd=$fopen(fixture_path,"r");
+        if(fd==0) $fatal(1,"SECURE_MEMORY cannot open %s",fixture_path);
+        rc=$fscanf(fd,"%d\n",shapes);
+        ck(rc==1&&shapes>0,"fixture declares at least one shape");
+        for(int s=0;s<3;s++) begin
+            rc=$fscanf(fd,"%h %h %h\n",tenant[s],key_value[s],iv_fixed[s]);
+            ck(rc==3,"fixture key-slot line parses");
+        end
+        repeat(3) @(negedge clk);
+        reset=0;
+        provision_all(0,0);
+        for(job=0;job<shapes;job++) begin
+            read_shape(fd);
+            run_job(job==0);
+        end
+        $fclose(fd);
+        $display("PASS SECURE_MEMORY AES%0d bus%0d data%0d acc%0d %0dx%0d banks%0d: %0d jobs, %0d output attempts, %0d loads, %0d stored rows, %0d rejected loads, %0d checks",
+                 AES_KEY_W,MEM_DATA_W,DATA_WIDTH,ACC_WIDTH,ROWS,COLS,WEIGHTS_PER_PE,shapes,output_attempts,loads,stored_rows,rejected_loads,checks);
+        $finish;
+    end
+endmodule

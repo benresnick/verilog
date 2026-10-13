@@ -131,6 +131,16 @@ module multi_read_matrix_buffer #(
         if (write_enable) data[write_row][write_col] <= write_data;
 `endif
     end
+
+`ifndef SYNTHESIS
+    // Simulation drops an out-of-range array write, but synthesis truncates the
+    // address and overwrites a real entry.  Callers must range-check writes.
+    always @(posedge clk)
+        if (write_enable)
+            assert (write_row < ROWS && write_col < COLS)
+                else $fatal(1, "multi_read_matrix_buffer: write [%0d][%0d] outside %0dx%0d",
+                            write_row, write_col, ROWS, COLS);
+`endif
 endmodule
 
 // OBuff implementation for the systolic array.  Each physical column owns a
@@ -202,5 +212,18 @@ module multi_write_output_buffer #(
             end
         end
     end
+
+`ifndef SYNTHESIS
+    // Every port writes inside the array. Same-entry collisions between ports
+    // are legal here (the highest port wins, as buffers_stress_tb expects); the
+    // accelerator controller asserts that its own schedule never collides.
+    always @(posedge clk)
+        if (!reset && !clear_valids)
+            for (int port = 0; port < WRITE_PORTS; port++)
+                if (write_enable[port])
+                    assert (write_row[port] < ROWS && write_col[port] < COLS)
+                        else $fatal(1, "multi_write_output_buffer: port %0d write [%0d][%0d] outside %0dx%0d",
+                                    port, write_row[port], write_col[port], ROWS, COLS);
+`endif
 endmodule
 

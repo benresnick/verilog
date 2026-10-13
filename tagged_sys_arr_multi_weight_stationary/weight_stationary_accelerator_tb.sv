@@ -241,6 +241,11 @@ module weight_stationary_accelerator_tb;
                            golden[i][j], dram_c[i][j]);
                     errors++;
                 end
+            // Every useful multiply-accumulate is counted exactly once.
+            if (macs !== 32'(m * k * n)) begin
+                $error("%s debug_mac_count=%0d, expected M*K*N=%0d", name, macs, m * k * n);
+                errors++;
+            end
             if (errors == 0) begin
                 $display("[PASS] %s loads=%0d macs=%0d", name, loads, macs);
                 passed++;
@@ -311,6 +316,43 @@ module weight_stationary_accelerator_tb;
         end
     endtask
 
+    // Coordinates are wide enough to encode MAX and beyond.  Simulation drops
+    // an out-of-range array write, but synthesis truncates the address and
+    // overwrites a real row, so such a write must never reach a buffer port.
+    logic oob_port_write = 0;
+    always @(posedge clk) if (!reset) begin
+        if (dut.u_ibuff.write_enable && (dut.u_ibuff.write_row >= MAX_M || dut.u_ibuff.write_col >= MAX_K))
+            oob_port_write <= 1;
+        if (dut.u_wbuff.write_enable && (dut.u_wbuff.write_row >= MAX_K || dut.u_wbuff.write_col >= MAX_N))
+            oob_port_write <= 1;
+    end
+
+    task automatic check_out_of_range_writes;
+        begin
+            if ((1 << MW) > MAX_M) begin
+                @(negedge clk); a_we = 1; a_row = MAX_M; a_col = 0; a_data = 7;
+                @(negedge clk); a_we = 0;
+            end
+            if ((1 << KW) > MAX_K) begin
+                @(negedge clk); a_we = 1; a_row = 0; a_col = MAX_K; a_data = 7;
+                @(negedge clk); a_we = 0; b_we = 1; b_row = MAX_K; b_col = 0; b_data = 7;
+                @(negedge clk); b_we = 0;
+            end
+            if ((1 << NW) > MAX_N) begin
+                @(negedge clk); b_we = 1; b_row = 0; b_col = MAX_N; b_data = 7;
+                @(negedge clk); b_we = 0;
+            end
+            @(posedge clk);
+            if (oob_port_write) begin
+                $error("out-of-range host write reached a buffer write port");
+                failed++;
+            end else begin
+                $display("[PASS] out-of-range host writes are dropped before the buffers");
+                passed++;
+            end
+        end
+    endtask
+
     // Simulation invariants.  These observe the internal scheduler only for
     // diagnosis; functional checking continues to use the public result port.
     logic done_seen;
@@ -359,6 +401,7 @@ module weight_stationary_accelerator_tb;
         check_invalid_job(1, 1, MAX_N + 1);
         check_missing_data_job();
         check_reset_during_compute();
+        check_out_of_range_writes();
         run_case(1, 1, 1, 1, 0, 0, "scalar signed");
         run_case(3, 2, 2, 2, 0, 0, "M greater than rows");
         run_case(2, 8, 4, 3, 0, 0, "canonical 2x8 by 8x4");

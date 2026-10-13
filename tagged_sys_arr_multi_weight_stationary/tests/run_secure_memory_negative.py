@@ -11,6 +11,7 @@ import json
 import re
 import shutil
 import tempfile
+from pathlib import Path
 
 from run_secure_memory import ROOT, SOURCES
 from run_tenant_gcm_negative import run_case
