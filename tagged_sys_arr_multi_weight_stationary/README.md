@@ -13,14 +13,33 @@ storage, activations move left-to-right, and partial sums move top-to-bottom.
 The tagged build proves that each live partial sum and final result remains
 associated with the trusted tag assigned to its source activation row.
 
-> The plain and tagged builds still carry plaintext on their memory and result
-> interfaces. The secure-memory build (`secure_memory_accelerator.sv`, with
-> `ENABLE_SECURE_TAGS` and `ENABLE_SECURE_MEMORY`) accepts A and B only as
-> authenticated AES-GCM row records and emits C only as encrypted records that
-> retire after a matching storage acknowledgement. `make test-secure-memory`
-> verifies that path end to end against OpenSSL. See
-> [secure memory](docs/secure-memory.md) and
-> [crypto implementation status](docs/crypto-primitives.md).
+## Three builds from one source
+
+| Build | Defines | Top module | What it adds |
+| --- | --- | --- | --- |
+| Plain | none | `weight_stationary_accelerator` | The numerical baseline. No tag or crypto logic is elaborated. |
+| Tagged | `ENABLE_SECURE_TAGS` | `weight_stationary_accelerator` | A 96-bit ownership tag per A row, carried beside the math and stored with every C entry; any mismatch raises a sticky, fail-closed `security_fault`. Interfaces stay plaintext. |
+| Secure memory | `ENABLE_SECURE_TAGS` + `ENABLE_SECURE_MEMORY` | `secure_memory_accelerator` | A and B arrive only as authenticated AES-GCM row records; C leaves only as encrypted records, retired after a matching storage acknowledgement. The tenant ID that authenticates a record becomes its row's tag. |
+
+Tags keep tenants apart inside the chip; encryption protects them from anyone
+who can read or modify memory. See [secure memory](docs/secure-memory.md) and
+[crypto implementation status](docs/crypto-primitives.md).
+
+## Status (14 Oct 2026)
+
+- `make full-ci` and `make rigorous-ci` pass under Icarus Verilog 13, and
+  Verilator 5 lint is clean on all three builds.
+- Formal checks found a race in the tagged build: a configure and a `start` on
+  the same edge launched a job on the epoch the configure had just erased.
+  It is fixed (a start on a configure edge is refused) with a regression test,
+  and the tagged-core properties are now proved at two array shapes.
+- Blind tests written only from this spec, with no access to the RTL, found no
+  violations on the current design. They did find flushed results lingering on
+  the tagged result port while `result_valid` was low; the port now reads zero
+  without a valid result.
+- The main open gap is replay freshness: an old but valid record for the same
+  tenant, row and length still authenticates. See
+  [Limitations](#limitations-and-intended-next-integration).
 
 ## What the protected tag plane does
 
@@ -157,11 +176,34 @@ the entire 96-bit value as opaque metadata.
 | `tenant_gcm_port.sv`, `tenant_gcm_cluster.sv` | Three trusted tenant-aware crypto paths, shared key management, fresh encryption IVs, and automatic authenticated metadata. |
 | `tenant_gcm_cluster_tb.sv`, `tests/run_tenant_gcm.py`, `tests/run_tenant_gcm_negative.py` | Independent record oracle, concurrent tenants, key lifecycle/nonce races, tampering, and negative controls. |
 | `weight_stationary_accelerator_tb.sv` | Original numerical end-to-end regression. |
+| `pe_tb.sv`, `pe_stress_tb.sv`, `buffers_tb.sv`, `buffers_stress_tb.sv`, `sysarr_stress_tb.sv` | Unit and stress benches for the PE, the buffers, and the generated mesh. |
+| `secure_tags_stress_tb.sv` | Randomized stress of the shared tag queue and tag store. |
+| `aes_primitives_tb.sv`, `gf128_mul_tb.sv`, `tenant_key_stress_tb.sv` | Primitive unit tests and key-file stress. |
+| `tests/run_rigorous.py` | Extended campaign: independent AES oracle, parameter and stress sweeps, configuration rejections, and mutation controls. |
 | `authenticated_row_stager.sv`, `authenticated_row_stager_tb.sv` | Collects an authenticated row and commits it to IBuff/WBuff atomically. |
 | `secure_memory_accelerator.sv` | Secure-memory top level: encrypted A/B loads, tagged compute, encrypted C stores with acknowledgement-gated retirement. |
 | `secure_memory_accelerator_tb.sv`, `tests/run_secure_memory.py`, `tests/run_secure_memory_negative.py` | End-to-end OpenSSL record oracle, tampering, cancellation, storage retry, reset/abort lifecycle, and mutation controls. |
 | `verilator_waivers.vlt` | Documented, narrowly scoped waivers for `make verilator-lint`. |
 | `docs/shared-tag-queue-timing.png` | The shared-queue timing diagram used above. |
+
+## How it is verified
+
+Every risk below is covered by at least two independent methods.
+
+| Method | How | Result |
+| --- | --- | --- |
+| Directed and random simulation | Each output is compared with an independent model: a plain matrix formula, never a copy of the RTL schedule. | Plain build 24 cases on 9 shapes plus random sweeps; tagged build 30 cases on 6 shapes. |
+| In-simulation monitors | `$fatal` assertions in the RTL and testbenches check scheduler and security invariants on every cycle. | No violations. |
+| Crypto oracles | AES, GHASH, GCTR and GCM against NIST vectors and OpenSSL EVP, including forged tags, bad framing and cancellation. | 2,432 GCM transactions, 828 forged-tag rejections; 3,522 tenant-wrapper transactions. |
+| End to end | Python seals A and B records with OpenSSL; the RTL decrypts, computes and re-encrypts C; Python opens C with OpenSSL and checks it against its own matrix multiply. | 4 configurations, 440k to 514k checks each. |
+| Mutation | A known bug is planted in a copy of the RTL and the suite must fail. | 25 planted bugs, 25 caught (`make rigorous-ci`). |
+| Formal (outside the make flow) | Yosys to AIGER, ABC PDR/BMC; every input free after reset. | Row stager S1–S4 proved; tagged core T1–T4 and P1–P3 proved at 2×2 and 2×3 after the race fix; key-file IV reuse bounded to depth 9 under the provisioning contract. |
+| Blind tests (outside the make flow) | A red team and a random-command fuzzer with its own Python security model, written from the spec text, a threat model and the port list, never the RTL. | About 75 attacks on 7 shapes and 5,000 fuzz runs of 500 cycles: no violations. Both rediscovered the race on the pre-fix RTL. |
+| Coverage (Verilator) | Repository testbenches with coverage enabled, RTL only. | About 98% of lines and 96% of branches on the plain and tagged builds; every miss is defensive code. |
+
+The formal, blind, coverage and synthesis harnesses are not part of this
+directory's make flow; their results are recorded here and in the
+[verification matrix](docs/verification.md).
 
 ## Build and verification
 
@@ -216,11 +258,15 @@ make rigorous-ci
 The [verification matrix](docs/verification.md) lists the per-module checks,
 reproduction commands, and limits of simulation coverage.
 
-The secure suite covers one, two, three, and per-row-distinct users; K and N
-tiling; partial N tiles; resident-weight banks; full capacities; back-to-back
-jobs; result backpressure; reset; trusted abort; missing tags; conflicting row
-tags; and verification-only fault injection for missing feedback metadata and
-invalid commit taps.
+The tagged suite (30 cases on each of 6 shapes) covers one, two, three, and
+per-row-distinct users; K and N tiling; partial N tiles; resident-weight banks;
+full capacities; back-to-back jobs; result backpressure; reset; trusted abort;
+missing tags; conflicting row tags; epoch isolation; out-of-range host writes;
+same-edge configure/A-write and configure/start; a blank result port after
+abort or reset; and verification-only fault injection for missing feedback
+metadata and invalid commit taps. Monitors check on every cycle that each
+export carries a valid tag, nothing is exported while faulted, a stalled result
+does not change, and the result port reads zero without `result_valid`.
 
 `SECURE_TAG_TEST_HOOKS` is defined only by tagged simulation targets. It adds
 internal verification hooks, not production ports, for negative testing.
@@ -240,6 +286,10 @@ not change queue depth or tap positions for a single compute pass.
 
 ## Limitations and intended next integration
 
+- No replay freshness: record authentication binds tenant, type, length and
+  row, but not time, so an old valid record for the same context is accepted.
+  Candidate fixes are a job epoch in the AAD, a fresh key per job, or per-row
+  versions.
 - Only the secure-memory build encrypts and authenticates memory transfers;
   the plain and tagged builds remain plaintext at their interfaces.
 - The tenant key file is volatile. The trusted provisioner must never restart
@@ -250,5 +300,10 @@ not change queue depth or tap positions for a single compute pass.
   side-channel leakage.
 - The trusted ports should be connected through a production trusted-ingress /
   trusted-egress wrapper before integration into a software-visible system.
-- No synthesis/area comparison is included because no synthesis tool is part
-  of this repository-local flow.
+- Synthesis is not part of the repository flow. Out-of-repo Yosys/nextpnr
+  estimates for ECP5 are FPGA-only: the plain build closes at 33.5 MHz, and the
+  default secure build (about 647k LUT4) is far beyond a single ECP5. There is
+  no ASIC flow, SRAM macro, or power estimate.
+- The tagged build stores a full 96-bit tag beside every C entry, which
+  dominates its area; one tag per row would carry the same ownership.
+- `trusted_abort` always leaves a sticky fault, so recovery needs a reset.
