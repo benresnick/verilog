@@ -127,6 +127,20 @@ module secure_tagging_tb;
   passed++;$display("[PASS] start on a configure edge is refused and exports nothing");
   run_ok(1,1,1,0,0,204,"normal job after refused same-edge start");
  end endtask
+ // A result stalled on the port, then flushed by abort or reset, must not stay
+ // visible: the port reads zero whenever result_valid is low.
+ task automatic result_port_blank_after_flush(input bit use_reset); begin
+  load(1,1,1,4,205);step;result_ready=0;start=1;step;start=0;
+  wait(result_valid);repeat(3)step;
+  if(use_reset)reset=1;else trusted_abort=1;
+  step;reset=0;trusted_abort=0;
+  repeat(20) begin @(posedge clk);#1;
+   if(result_valid||result_data!==0||result_row!==0||result_col!==0||trusted_result_tag!==0)
+    $fatal(1,"flushed result is still visible on the result port");
+  end
+  result_ready=1;passed++;
+  $display("[PASS] result port is blank after %s flushes a stalled result",use_reset?"reset":"abort");
+ end endtask
  // Coordinates are wide enough to encode MAX and beyond.  Such writes must
  // never reach a buffer write port (synthesis would alias them onto real rows)
  // and must not bind a tag or fault.
@@ -161,6 +175,8 @@ module secure_tagging_tb;
    if(pc>=dut.active_cols) assert(!dut.secure_tag_write_enable[pc]) else $fatal(1,"inactive tile tag write pc=%0d",pc);
   end
   if(result_valid) assert(trusted_result_tag_valid && !security_fault) else $fatal(1,"untrusted final export");
+  if(!result_valid) assert(result_data===0 && result_row===0 && result_col===0 && trusted_result_tag===0)
+   else $fatal(1,"result port shows a value while result_valid is low");
   if(security_fault) assert(!result_valid) else $fatal(1,"faulted result exported");
  end
  logic was_stalled=0;
@@ -179,6 +195,7 @@ module secure_tagging_tb;
   passed=0;clean_reset();no_tag();clean_reset();ingress_fault();clean_reset();
   out_of_range_writes();clean_reset();epoch_isolation();clean_reset();same_edge_epoch_binding();clean_reset();
   same_edge_configure_start();clean_reset();
+  result_port_blank_after_flush(0);clean_reset();result_port_blank_after_flush(1);clean_reset();
   if($value$plusargs("stress_iters=%d",stress_iters))begin end
   if($value$plusargs("seed=%d",seed))begin end
   rng=seed;

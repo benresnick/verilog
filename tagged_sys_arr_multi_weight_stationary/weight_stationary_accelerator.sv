@@ -254,17 +254,20 @@ module weight_stationary_accelerator #(
                      ;
   result_valid = raw_result_valid && secure_obuff_read_valid[COLS] && !security_fault;
   trusted_result_tag_valid = result_valid;
-`ifdef ENABLE_SECURE_MEMORY
   trusted_result_tag = result_valid ? secure_obuff_read_tag[COLS] : '0;
-`else
-  trusted_result_tag = secure_obuff_read_tag[COLS];
-`endif
 `else
   result_valid = (state == RESULTS) && obuf_read_final[COLS];
 `endif
   result_row = out_m;
 `ifdef ENABLE_SECURE_MEMORY
   result_col = result_valid ? trusted_result_read_col : '0;
+  result_data = result_valid ? obuf_read_data[COLS] : '0;
+`elsif ENABLE_SECURE_TAGS
+  // The result port carries a value only with result_valid.  OBuff keeps
+  // partial sums and flushed results across abort and reset, so an unmasked
+  // port would show them to whoever drives result_ready.
+  result_row = result_valid ? out_m : '0;
+  result_col = result_valid ? out_n : '0;
   result_data = result_valid ? obuf_read_data[COLS] : '0;
 `else
   result_col = out_n;
