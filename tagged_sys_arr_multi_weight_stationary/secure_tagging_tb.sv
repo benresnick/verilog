@@ -112,6 +112,21 @@ module secure_tagging_tb;
   if(!done||count!=1||security_fault)$fatal(1,"same-edge epoch job did not complete");
   passed++;$display("[PASS] configure and A binding on the same edge start a clean epoch");
  end endtask
+ // Configure and start on the same clock edge.  The configure opens a new
+ // epoch and clears every A binding, so the start must be refused rather than
+ // run the old dimensions over the cleared buffer (which exported zeros under
+ // tag 0 before the fix; found by the formal flow).
+ task automatic same_edge_configure_start; integer lim; begin
+  load(1,1,1,0,203);
+  step;config_we=1;config_m=1;config_k=1;config_n=1;start=1;
+  step;config_we=0;start=0;@(posedge clk);#1;
+  if(!job_error||busy||security_fault)$fatal(1,"start on a configure edge was accepted");
+  for(lim=0;lim<4*(ROWS+COLS+MAX_K+4);lim++) begin @(posedge clk);#1;
+   if(result_valid||busy||done)$fatal(1,"refused same-edge start produced output");
+  end
+  passed++;$display("[PASS] start on a configure edge is refused and exports nothing");
+  run_ok(1,1,1,0,0,204,"normal job after refused same-edge start");
+ end endtask
  // Coordinates are wide enough to encode MAX and beyond.  Such writes must
  // never reach a buffer write port (synthesis would alias them onto real rows)
  // and must not bind a tag or fault.
@@ -163,6 +178,7 @@ module secure_tagging_tb;
  initial begin
   passed=0;clean_reset();no_tag();clean_reset();ingress_fault();clean_reset();
   out_of_range_writes();clean_reset();epoch_isolation();clean_reset();same_edge_epoch_binding();clean_reset();
+  same_edge_configure_start();clean_reset();
   if($value$plusargs("stress_iters=%d",stress_iters))begin end
   if($value$plusargs("seed=%d",seed))begin end
   rng=seed;

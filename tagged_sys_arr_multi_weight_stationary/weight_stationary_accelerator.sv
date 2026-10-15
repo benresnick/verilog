@@ -474,7 +474,8 @@ module weight_stationary_accelerator #(
         job_accept = m_cfg != 0 && k_cfg != 0 && n_cfg != 0 &&
                      m_cfg <= MAX_M && k_cfg <= MAX_K && n_cfg <= MAX_N && inputs_ready;
 `ifdef ENABLE_SECURE_TAGS
-        if (security_fault) job_accept = 1'b0;
+        // A configure on the start edge clears every A binding: refuse the start.
+        if (security_fault || config_we) job_accept = 1'b0;
 `endif
 `ifdef ENABLE_SECURE_MEMORY
         if (memory_cancel || config_we) job_accept = 1'b0;
