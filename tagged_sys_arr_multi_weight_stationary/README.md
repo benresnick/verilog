@@ -100,6 +100,26 @@ Public B elements stay valid across epochs. A configure and an A write on the
 same clock edge belong to the new epoch. While `security_fault` is set, the
 ready outputs are low and configure, A and B writes are ignored.
 
+Edge cases in the tagged build:
+
+- A `start` on the same edge as an accepted `config_we` is refused with
+  `job_error`: the configure clears every A binding, so there is nothing valid
+  to run.
+- An A write without a simultaneous `trusted_tag_we` is ignored. Only trusted
+  ingress can place activation data.
+- Binding a row to a different tag within one epoch raises `security_fault`.
+  A change of owner needs a new configure.
+- `start` is checked against the state before its edge. An A or B write on the
+  start edge does not make a refused job runnable. When the job does start, a
+  same-owner A write on that edge is included in it.
+- `trusted_abort` flushes all work and raises the sticky `security_fault`, even
+  when idle. Only `reset` returns the accelerator to service.
+- A result handshake on the same edge as `trusted_abort` or `reset` completes.
+  Nothing is exported after that edge.
+- `result_row`, `result_col`, `result_data` and `trusted_result_tag` read zero
+  whenever `result_valid` is low. OBuff keeps partial sums and flushed results
+  across abort and reset, and the port never shows them.
+
 In every build, host writes whose coordinates exceed `MAX_M`, `MAX_K` or `MAX_N`
 are ignored. The coordinate ports can encode those values, and without the range
 check a synthesized buffer would truncate the address and overwrite a real row.
